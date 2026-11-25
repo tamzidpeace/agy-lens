@@ -1,5 +1,5 @@
 {
-  "context-guard": {
+  "agy-context-guard": {
     "enabled": true,
     "SessionStart": [
       {

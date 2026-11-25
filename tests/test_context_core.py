@@ -466,6 +466,93 @@ class TestConfigAndState(unittest.TestCase):
                 self.assertEqual(len(overview["conversations"]), 1)
                 self.assertEqual(overview["conversations"][0]["conversationId"], "conv-1")
                 self.assertEqual(overview["conversations"][0]["status"], "warn")
+                self.assertEqual(overview["conversations"][0]["title"], "Analyze code")
+
+    def test_title_resolution_pbtxt_sqlite_subagent_and_prompt_fallback(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "antigravity"
+            cfg_path = Path(tmp) / "context-guard.json"
+            for cid, prompt in (
+                ("c-pbtxt", "First prompt ignored because pbtxt wins"),
+                ("c-sqlite", "Prompt ignored because sqlite wins"),
+                ("c-sub", "Review Task 1 files"),
+                ("c-prompt", "<USER_REQUEST>\nBuild shiny dashboard\n</USER_REQUEST>"),
+            ):
+                _write_jsonl(
+                    root / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl",
+                    [
+                        {
+                            "step_index": 0,
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "status": "DONE",
+                            "created_at": "2026-11-25T10:00:00Z",
+                            "content": prompt,
+                        },
+                        {
+                            "step_index": 1,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-25T10:00:05Z",
+                            "model": "gemini-4-hydrogen-high",
+                            "input_tokens": 5_000,
+                            "cache_read_tokens": 10_000,
+                            "output_tokens": 500,
+                        },
+                    ],
+                )
+
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(parents=True, exist_ok=True)
+            (ann_dir / "c-pbtxt.pbtxt").write_text(
+                'title:"বাংলা টাইটেল \\"Demo\\""  last_user_view_time:{seconds:1}',
+                encoding="utf-8",
+            )
+
+            db_path = root / "conversation_summaries.db"
+            con = sqlite3.connect(str(db_path))
+            con.execute(
+                "CREATE TABLE conversation_summaries ("
+                "conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, "
+                "parent_conversation_id TEXT, agent_name TEXT)"
+            )
+            con.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
+                ("c-pbtxt", "Stale SQLite Title", "", "", ""),
+            )
+            con.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
+                ("c-sqlite", "SQLite Session Title", "", "", ""),
+            )
+            con.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
+                ("c-sub", "", "", "c-pbtxt", "context-guard-reviewer"),
+            )
+            con.commit()
+            con.close()
+
+            env = {
+                "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path),
+                "CONTEXT_GUARD_BRAIN_ROOTS": str(root),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                cfg = core.load_config()
+                pb_status = core.build_status_payload("c-pbtxt", config=cfg)
+                self.assertEqual(pb_status["title"], 'বাংলা টাইটেল "Demo"')
+                self.assertFalse(pb_status["isSubagent"])
+
+                overview = core.build_overview_payload(config=cfg, limit=10)
+                by_id = {c["conversationId"]: c for c in overview["conversations"]}
+                self.assertEqual(by_id["c-pbtxt"]["title"], 'বাংলা টাইটেল "Demo"')
+                self.assertEqual(by_id["c-sqlite"]["title"], "SQLite Session Title")
+                self.assertEqual(by_id["c-sub"]["title"], "Review Task 1 files")
+                self.assertTrue(by_id["c-sub"]["isSubagent"])
+                self.assertEqual(by_id["c-sub"]["agentName"], "context-guard-reviewer")
+                self.assertEqual(by_id["c-sub"]["parentConversationId"], "c-pbtxt")
+                self.assertEqual(by_id["c-prompt"]["title"], "Build shiny dashboard")
 
     def test_config_pruning_and_corrupt_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

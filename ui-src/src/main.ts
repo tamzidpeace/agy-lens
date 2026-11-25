@@ -45,6 +45,10 @@ export interface BloatByCategory {
 export interface StatusPayload {
   view: "status";
   conversationId: string | null;
+  title?: string;
+  agentName?: string;
+  parentConversationId?: string;
+  isSubagent?: boolean;
   status: GuardStatus;
   enabled: boolean;
   mode: GuardMode;
@@ -75,6 +79,10 @@ export interface StatusPayload {
 
 export interface OverviewConversation {
   conversationId: string;
+  title?: string;
+  agentName?: string;
+  parentConversationId?: string;
+  isSubagent?: boolean;
   sourceApp: string;
   model: string;
   effectiveTokens: number;
@@ -199,6 +207,7 @@ interface DashboardState {
   hostCapabilities: McpUiHostCapabilities | undefined;
   hostContext: McpUiHostContext | undefined;
   overviewPrefetched: boolean;
+  hideSubagents: boolean;
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -745,12 +754,31 @@ function renderBanner(
   return banner;
 }
 
+function shortConvId(cid: string | null | undefined): string {
+  if (!cid) return "";
+  return cid.length > 8 ? cid.slice(0, 8) : cid;
+}
+
+function formatConversationOptionLabel(
+  title: string | undefined,
+  cid: string,
+  extra?: string,
+): string {
+  const cleanTitle = (title || "").trim();
+  const shortId = shortConvId(cid);
+  if (cleanTitle && cleanTitle !== cid) {
+    const compact =
+      cleanTitle.length > 46 ? `${cleanTitle.slice(0, 43).trimEnd()}...` : cleanTitle;
+    return extra ? `${compact} · ${shortId} (${extra})` : `${compact} · ${shortId}`;
+  }
+  return extra ? `${cid} (${extra})` : cid;
+}
+
 function renderDetailSubheader(
   doc: Document,
   status: StatusPayload,
   state: DashboardState,
   controller: DashboardController,
-  onPrefetchOverview: () => void,
 ): HTMLElement {
   const row = el(doc, "div", "cg-subheader");
   const selectWrap = el(doc, "div", "cg-conv-select-wrap");
@@ -776,9 +804,15 @@ function renderDetailSubheader(
   } else {
     for (const cid of knownIds) {
       const overviewMatch = overviewList.find((c) => c.conversationId === cid);
-      const label = overviewMatch
-        ? `${cid} (${overviewMatch.sourceApp})`
-        : cid;
+      const title =
+        cid === currentId
+          ? status.title || overviewMatch?.title
+          : overviewMatch?.title;
+      const label = formatConversationOptionLabel(
+        title,
+        cid,
+        overviewMatch?.sourceApp,
+      );
       const opt = el(doc, "option", undefined, label);
       opt.value = cid;
       opt.selected = cid === currentId;
@@ -787,9 +821,6 @@ function renderDetailSubheader(
     select.disabled = !state.hostCapabilities?.serverTools;
   }
 
-  select.addEventListener("focus", () => {
-    onPrefetchOverview();
-  });
   select.addEventListener("change", () => {
     if (select.value && select.value !== currentId) {
       void controller.selectConversation(select.value);
@@ -799,6 +830,16 @@ function renderDetailSubheader(
   row.appendChild(selectWrap);
 
   const badges = el(doc, "div", "cg-badge-row");
+  if (status.isSubagent) {
+    badges.appendChild(
+      el(
+        doc,
+        "span",
+        "cg-pill cg-pill-muted",
+        status.agentName || "Subagent",
+      ),
+    );
+  }
   const modelLabel = status.model || "No model telemetry";
   const modelBadge = el(doc, "span", "cg-model-badge", modelLabel);
   modelBadge.title = modelLabel;
@@ -1441,25 +1482,45 @@ function renderOverviewView(
   state: DashboardState,
   controller: DashboardController,
   onToggleSettings: () => void,
+  onToggleSubagents: () => void,
 ): HTMLElement[] {
   const nodes: HTMLElement[] = [];
 
+  const mainConversations = overview.conversations.filter((c) => !c.isSubagent);
+  const subagentCount = overview.conversations.length - mainConversations.length;
+  const visibleConversations =
+    state.hideSubagents && subagentCount > 0 && mainConversations.length > 0
+      ? mainConversations
+      : overview.conversations;
+
   const summaryCard = el(doc, "section", "cg-card");
   const head = el(doc, "div", "cg-card-head");
-  head.appendChild(
-    el(
-      doc,
-      "span",
-      "cg-card-title",
-      `Recent Conversations (${overview.conversations.length})`,
-    ),
-  );
-  head.appendChild(
+  const countLabel =
+    subagentCount > 0 && state.hideSubagents && mainConversations.length > 0
+      ? `Recent Conversations (${visibleConversations.length} main · ${subagentCount} subagents hidden)`
+      : `Recent Conversations (${visibleConversations.length})`;
+  head.appendChild(el(doc, "span", "cg-card-title", countLabel));
+
+  const headActions = el(doc, "div", "cg-header-controls");
+  if (subagentCount > 0 && mainConversations.length > 0) {
+    headActions.appendChild(
+      createButton(
+        doc,
+        state.hideSubagents ? `Show Subagents (${subagentCount})` : "Hide Subagents",
+        {
+          className: state.hideSubagents ? "cg-btn cg-btn-sm" : "cg-btn cg-btn-sm cg-btn-active",
+          onClick: onToggleSubagents,
+        },
+      ),
+    );
+  }
+  headActions.appendChild(
     createButton(doc, state.settingsOpen ? "Hide Settings" : "Settings", {
       className: state.settingsOpen ? "cg-btn cg-btn-sm cg-btn-active" : "cg-btn cg-btn-sm",
       onClick: onToggleSettings,
     }),
   );
+  head.appendChild(headActions);
   summaryCard.appendChild(head);
 
   summaryCard.appendChild(
@@ -1472,7 +1533,7 @@ function renderOverviewView(
   );
   nodes.push(summaryCard);
 
-  if (overview.conversations.length === 0) {
+  if (visibleConversations.length === 0) {
     const emptyCard = el(doc, "section", "cg-card cg-empty");
     emptyCard.appendChild(
       el(
@@ -1490,7 +1551,7 @@ function renderOverviewView(
   const activeId = overview.active?.conversationId || null;
   const canServerTools = Boolean(state.hostCapabilities?.serverTools);
 
-  for (const conv of overview.conversations) {
+  for (const conv of visibleConversations) {
     const card = el(doc, "button", "cg-conv-card");
     card.type = "button";
     card.disabled = !canServerTools;
@@ -1499,17 +1560,28 @@ function renderOverviewView(
     });
 
     const top = el(doc, "div", "cg-conv-top");
-    const idWrap = el(doc, "div", "cg-brand");
+    const idWrap = el(doc, "div", "cg-conv-left");
     idWrap.appendChild(
       el(doc, "span", statusPillClass(conv.status), statusDisplayLabel(conv.status)),
     );
-    const idEl = el(doc, "span", "cg-conv-id", conv.conversationId);
-    idEl.title = conv.conversationId;
-    idWrap.appendChild(idEl);
+    const displayTitle = (conv.title || "").trim() || conv.conversationId;
+    const titleEl = el(doc, "span", "cg-conv-title", displayTitle);
+    titleEl.title = `${displayTitle} (${conv.conversationId})`;
+    idWrap.appendChild(titleEl);
+    if (displayTitle !== conv.conversationId) {
+      const subIdEl = el(doc, "span", "cg-conv-subid", shortConvId(conv.conversationId));
+      subIdEl.title = conv.conversationId;
+      idWrap.appendChild(subIdEl);
+    }
 
     const badges = el(doc, "div", "cg-badge-row");
     if (activeId && conv.conversationId === activeId) {
       badges.appendChild(el(doc, "span", "cg-pill cg-pill-info", "Active"));
+    }
+    if (conv.isSubagent) {
+      badges.appendChild(
+        el(doc, "span", "cg-pill cg-pill-muted", conv.agentName || "Subagent"),
+      );
     }
     badges.appendChild(
       el(doc, "span", "cg-pill cg-pill-muted", conv.sourceApp || "Antigravity"),
@@ -1608,6 +1680,7 @@ export async function mountDashboard(
     hostCapabilities: undefined,
     hostContext: undefined,
     overviewPrefetched: false,
+    hideSubagents: true,
   };
 
   let initialFallbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2134,6 +2207,10 @@ export async function mountDashboard(
         state,
         controller,
         toggleSettings,
+        () => {
+          state.hideSubagents = !state.hideSubagents;
+          render();
+        },
       )) {
         shell.appendChild(node);
       }
@@ -2144,7 +2221,6 @@ export async function mountDashboard(
           state.statusData,
           state,
           controller,
-          prefetchOverviewOnce,
         ),
       );
       shell.appendChild(renderGaugeCard(doc, state.statusData));
@@ -2214,6 +2290,9 @@ export async function mountDashboard(
       applyStructuredResult(result.structuredContent, { switchView: true });
     }
     render();
+    if (state.currentView === "status") {
+      prefetchOverviewOnce();
+    }
   };
 
   app.ontoolcancelled = (params) => {
@@ -2240,6 +2319,9 @@ export async function mountDashboard(
     state.hostCapabilities = app.getHostCapabilities();
     applyHostContext(app.getHostContext());
     render();
+    if (state.hasInitialToolResult && state.currentView === "status") {
+      prefetchOverviewOnce();
+    }
 
     const fallbackDelay = deps.autoFetchDelayMs ?? 250;
     if (

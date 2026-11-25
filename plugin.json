@@ -1,6 +1,6 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
-  "name": "context-guard",
+  "name": "agy-context-guard",
   "displayName": "Context Guard",
   "version": "1.0.0",
   "description": "Real-time context window monitor, bloat inspector, and configurable threshold guard with a live side-pane dashboard and one-click session handoff.",
@@ -14,8 +14,8 @@
     "name": "Arafat",
     "url": "https://github.com/tamzidpeace"
   },
-  "homepage": "https://github.com/tamzidpeace/context-guard",
-  "repository": "https://github.com/tamzidpeace/context-guard",
+  "homepage": "https://github.com/tamzidpeace/agy-context-guard",
+  "repository": "https://github.com/tamzidpeace/agy-context-guard",
   "license": "MIT",
   "keywords": [
     "context",

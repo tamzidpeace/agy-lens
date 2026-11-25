@@ -125,7 +125,7 @@ class TestMcpServer(unittest.TestCase):
             self.assertIn("resources", init_res["capabilities"])
             self.assertEqual(
                 init_res["serverInfo"],
-                {"name": "context-guard-monitor", "version": "1.0.0"},
+                {"name": "agy-context-guard-monitor", "version": "1.0.0"},
             )
 
             ping_resp = responses[1]

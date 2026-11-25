@@ -26,7 +26,7 @@ APP_URI = "ui://context-guard/dashboard.html"
 RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO: dict[str, str] = {
-    "name": "context-guard-monitor",
+    "name": "agy-context-guard-monitor",
     "version": "1.0.0",
 }
 DEFAULT_SNOOZE_DELTA_TOKENS = 50_000

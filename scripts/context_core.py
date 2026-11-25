@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,9 @@ _ADDITIONAL_METADATA_RE = re.compile(
     re.DOTALL,
 )
 _WHITESPACE_RE = re.compile(r"\s+")
+_TITLE_PBTXT_RE = re.compile(r'title:"((?:[^"\\]|\\.)*)"')
+_PBTXT_UNESCAPE = {"n": " ", "r": " ", "t": " ", '"': '"', "\\": "\\"}
+MAX_TITLE_CHARS = 72
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -600,6 +604,164 @@ def _infer_conv_id_from_path(transcript_path: Path) -> str | None:
     return None
 
 
+def _read_pbtxt_title(pbtxt_path: Path) -> str:
+    """Extract a conversation title from an Antigravity annotations/*.pbtxt file."""
+    try:
+        if not pbtxt_path.is_file():
+            return ""
+        raw = pbtxt_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = _TITLE_PBTXT_RE.search(raw)
+    if not match:
+        return ""
+    unescaped = re.sub(
+        r"\\(.)",
+        lambda m: _PBTXT_UNESCAPE.get(m.group(1), m.group(1)),
+        match.group(1),
+    )
+    return _WHITESPACE_RE.sub(" ", unescaped).strip()
+
+
+def _load_sqlite_conv_metadata(root: Path) -> dict[str, dict[str, Any]]:
+    """Read conversation titles and parent/subagent metadata from conversation_summaries.db."""
+    db_path = root / "conversation_summaries.db"
+    meta: dict[str, dict[str, Any]] = {}
+    try:
+        if not db_path.is_file():
+            return meta
+    except OSError:
+        return meta
+
+    con: sqlite3.Connection | None = None
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=0.5)
+        cur = con.cursor()
+        tables = {
+            row[0]
+            for row in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "conversation_summaries" in tables:
+            cols = {
+                row[1]
+                for row in cur.execute("PRAGMA table_info(conversation_summaries)").fetchall()
+            }
+            if "conversation_id" in cols:
+                select_cols = [
+                    "conversation_id",
+                    "title" if "title" in cols else "''",
+                    "preview" if "preview" in cols else "''",
+                    "parent_conversation_id" if "parent_conversation_id" in cols else "''",
+                    "agent_name" if "agent_name" in cols else "''",
+                ]
+                query = f"SELECT {', '.join(select_cols)} FROM conversation_summaries"
+                for cid, title, preview, parent_id, agent_name in cur.execute(query).fetchall():
+                    if not isinstance(cid, str) or not cid:
+                        continue
+                    clean_title = _WHITESPACE_RE.sub(" ", str(title or preview or "")).strip()
+                    meta[cid] = {
+                        "title": clean_title,
+                        "parentConversationId": str(parent_id or "").strip(),
+                        "agentName": str(agent_name or "").strip(),
+                    }
+        if "conversation_parents" in tables:
+            for cid, parent_id in cur.execute(
+                "SELECT conversation_id, parent_id FROM conversation_parents"
+            ).fetchall():
+                if not isinstance(cid, str) or not cid or not isinstance(parent_id, str):
+                    continue
+                entry = meta.setdefault(
+                    cid, {"title": "", "parentConversationId": "", "agentName": ""}
+                )
+                if not entry["parentConversationId"]:
+                    entry["parentConversationId"] = parent_id.strip()
+    except (sqlite3.Error, OSError, ValueError):
+        return meta
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+    return meta
+
+
+def _collect_conv_metadata(
+    roots: list[Path],
+    conv_ids: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Collect title and parent/subagent metadata across Antigravity brain roots."""
+    merged: dict[str, dict[str, Any]] = {}
+    for root in roots:
+        for cid, info in _load_sqlite_conv_metadata(root).items():
+            target = merged.setdefault(
+                cid, {"title": "", "parentConversationId": "", "agentName": ""}
+            )
+            if not target["title"] and info["title"]:
+                target["title"] = info["title"]
+            if not target["parentConversationId"] and info["parentConversationId"]:
+                target["parentConversationId"] = info["parentConversationId"]
+            if not target["agentName"] and info["agentName"]:
+                target["agentName"] = info["agentName"]
+
+        ann_dir = root / "annotations"
+        try:
+            if not ann_dir.is_dir():
+                continue
+        except OSError:
+            continue
+
+        if conv_ids is not None:
+            candidates = [ann_dir / f"{cid}.pbtxt" for cid in conv_ids if _is_safe_conv_id(cid)]
+        else:
+            try:
+                candidates = list(ann_dir.glob("*.pbtxt"))
+            except OSError:
+                candidates = []
+
+        for pbtxt in candidates:
+            pb_title = _read_pbtxt_title(pbtxt)
+            if not pb_title:
+                continue
+            cid = pbtxt.stem
+            target = merged.setdefault(
+                cid, {"title": "", "parentConversationId": "", "agentName": ""}
+            )
+            # Annotation .pbtxt carries the latest user/auto-generated title.
+            target["title"] = pb_title
+    return merged
+
+
+def _resolve_conv_display_meta(
+    conv_id: str | None,
+    first_prompt: str,
+    meta_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve human-readable title and subagent attribution for a conversation."""
+    info = meta_map.get(conv_id, {}) if conv_id else {}
+    title = str(info.get("title") or "").strip()
+    parent_id = str(info.get("parentConversationId") or "").strip()
+    agent_name = str(info.get("agentName") or "").strip()
+
+    if not title and first_prompt:
+        compact = _WHITESPACE_RE.sub(" ", first_prompt).strip()
+        if len(compact) > MAX_TITLE_CHARS:
+            compact = compact[: MAX_TITLE_CHARS - 3].rstrip() + "..."
+        title = compact
+    if not title and conv_id:
+        title = conv_id
+
+    return {
+        "title": title,
+        "agentName": agent_name,
+        "parentConversationId": parent_id,
+        "isSubagent": bool(parent_id or agent_name),
+    }
+
+
 def _empty_analysis(transcript_path: str) -> dict[str, Any]:
     """Return zeroed analysis payload for missing or empty transcripts."""
     return {
@@ -986,6 +1148,7 @@ def build_status_payload(
     conv_id: str | None = None,
     explicit_path: str | None = None,
     config: dict[str, Any] | None = None,
+    _meta_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build full status dashboard payload for a conversation."""
     cfg = config if config is not None else load_config()
@@ -1047,11 +1210,29 @@ def build_status_payload(
         effective_threshold=effective_threshold,
     )
 
+    meta_map = (
+        _meta_map
+        if _meta_map is not None
+        else _collect_conv_metadata(
+            get_brain_roots(),
+            conv_ids=[target_conv_id] if target_conv_id else None,
+        )
+    )
+    display_meta = _resolve_conv_display_meta(
+        target_conv_id,
+        str(analysis.get("firstUserPrompt") or ""),
+        meta_map,
+    )
+
     payload = dict(analysis)
     payload.update(
         {
             "view": "status",
             "conversationId": target_conv_id,
+            "title": display_meta["title"],
+            "agentName": display_meta["agentName"],
+            "parentConversationId": display_meta["parentConversationId"],
+            "isSubagent": display_meta["isSubagent"],
             "status": status,
             "enabled": enabled,
             "mode": mode,
@@ -1079,6 +1260,10 @@ def build_overview_payload(
     enabled, mode, global_threshold, warn_percent = _normalize_global_settings(cfg)
 
     recent = list_recent_transcripts(limit=limit)
+    meta_map = _collect_conv_metadata(
+        get_brain_roots(),
+        conv_ids=[item["conversationId"] for item in recent],
+    )
     summaries: list[dict[str, Any]] = []
     last_active_id = cfg.get("lastActiveConversationId")
     active_summary: dict[str, Any] | None = None
@@ -1089,9 +1274,14 @@ def build_overview_payload(
             conv_id=cid,
             explicit_path=item["transcriptPath"],
             config=cfg,
+            _meta_map=meta_map,
         )
         summary = {
             "conversationId": cid,
+            "title": status_data["title"],
+            "agentName": status_data["agentName"],
+            "parentConversationId": status_data["parentConversationId"],
+            "isSubagent": status_data["isSubagent"],
             "sourceApp": item["sourceApp"],
             "model": status_data["model"],
             "effectiveTokens": status_data["effectiveTokens"],
@@ -1136,10 +1326,16 @@ def build_handoff_brief(
     effective_tokens = status["effectiveTokens"]
     threshold_tokens = status["effectiveThresholdTokens"]
 
+    conv_title = str(status.get("title") or "").strip()
+    if conv_title and conv_title != target_conv_id:
+        prev_label = f"{conv_title} (`{target_conv_id or 'unknown'}`)"
+    else:
+        prev_label = f"`{target_conv_id or 'unknown'}`"
+
     lines: list[str] = [
         "# Session Continuation Handoff",
         "",
-        f"- **Previous Conversation:** `{target_conv_id or 'unknown'}`",
+        f"- **Previous Conversation:** {prev_label}",
         (
             f"- **Context Usage:** {effective_tokens:,} / {threshold_tokens:,} tokens "
             f"({status['thresholdPercent']}%)"

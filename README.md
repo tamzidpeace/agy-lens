@@ -1,4 +1,4 @@
-# Context Guard (`context-guard`)
+# AGY Context Guard (`agy-context-guard`)
 
 <p align="left">
   <img src="assets/logo.svg" width="64" height="64" alt="Context Guard logo" />
@@ -12,7 +12,7 @@ Real-time context window monitor, token bloat inspector, and configurable thresh
 
 Long-running Antigravity sessions accumulate tokens across file reads, terminal outputs, search results, and multi-turn reasoning. Waiting until the model hits its hard window limit (e.g., ~1M tokens for Gemini models or 200k for Claude) increases latency, degrades reasoning quality ("context rot"), and triggers lossy background compaction mid-task.
 
-`context-guard` observes exact per-turn token metrics from `transcript.jsonl`, warns or pauses at a threshold you control (default `300,000` tokens), attributes bloat to specific tool calls, and helps you compact or hand off to a clean conversation in one click.
+`agy-context-guard` observes exact per-turn token metrics from `transcript.jsonl`, warns or pauses at a threshold you control (default `300,000` tokens), attributes bloat to specific tool calls, and helps you compact or hand off to a clean conversation in one click.
 
 ## Features
 
@@ -32,8 +32,8 @@ End users need **zero** `npm install` or `pip install` steps at runtime:
 ### Repository Layout
 
 ```text
-context-guard/
-├── plugin.json                 # Plugin manifest (name: context-guard)
+agy-context-guard/
+├── plugin.json                 # Plugin manifest (name: agy-context-guard)
 ├── mcp_config.json             # Launches python3 ${PLUGIN_ROOT}/server/mcp_server.py
 ├── hooks.json                  # SessionStart, PreInvocation, PostInvocation, Stop hooks
 ├── README.md                   # Documentation
@@ -68,25 +68,25 @@ context-guard/
 Clone the repository and install the local plugin directory:
 
 ```bash
-git clone https://github.com/tamzidpeace/context-guard.git
-agy plugin install ./context-guard
+git clone https://github.com/tamzidpeace/agy-context-guard.git
+agy plugin install ./agy-context-guard
 ```
 
-*(On Antigravity CLI versions that support direct GitHub URL or Marketplace installs, you can also use `agy plugin install https://github.com/tamzidpeace/context-guard`.)*
+*(On Antigravity CLI versions that support direct GitHub URL or Marketplace installs, you can also use `agy plugin install https://github.com/tamzidpeace/agy-context-guard`.)*
 
 ### Option 2: Manual Plugin Directory Copy
 
 Clone or copy the plugin directly into Antigravity's plugins directory:
 
 ```bash
-git clone https://github.com/tamzidpeace/context-guard.git ~/.gemini/config/plugins/context-guard
+git clone https://github.com/tamzidpeace/agy-context-guard.git ~/.gemini/config/plugins/agy-context-guard
 ```
 
 Verify the plugin is recognized and passes strict validation:
 
 ```bash
 agy plugin list
-agy plugin validate --strict ~/.gemini/config/plugins/context-guard
+agy plugin validate --strict ~/.gemini/config/plugins/agy-context-guard
 ```
 
 ## Lifecycle Hooks & Enforcement Modes

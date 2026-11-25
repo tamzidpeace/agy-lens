@@ -669,7 +669,32 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 8px;
+}
+
+.cg-conv-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.cg-conv-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-text-primary, var(--cg-text-primary));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.cg-conv-subid {
+  font-family: var(--font-mono, var(--cg-font-mono));
+  font-size: 10.5px;
+  color: var(--color-text-tertiary, var(--cg-text-tertiary));
+  flex-shrink: 0;
 }
 
 .cg-conv-id {

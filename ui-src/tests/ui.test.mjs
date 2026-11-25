@@ -792,3 +792,108 @@ test("compiled ui/app.html boots bundled ext-apps App and completes MCP ui/initi
     for (const id of vmTimers) clearTimeout(id);
   }
 });
+
+test("overview renders conversation titles and toggles subagent filter", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const mockApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: {} };
+    },
+    getHostContext() {
+      return { theme: "dark" };
+    },
+    async callServerTool() {
+      return { content: [], structuredContent: {} };
+    },
+    async sendMessage() {
+      return { isError: false };
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: mockApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  mockApp.ontoolresult({
+    structuredContent: {
+      view: "overview",
+      enabled: true,
+      mode: "stop",
+      thresholdTokens: 300000,
+      warnPercent: 80,
+      conversations: [
+        {
+          conversationId: "fee5bb10-fea1-4289-9552-dda76eb615c6",
+          title: "Context Guard Custom Plugin Development",
+          agentName: "",
+          parentConversationId: "",
+          isSubagent: false,
+          sourceApp: "antigravity",
+          model: "gemini-4-hydrogen-high",
+          effectiveTokens: 276100,
+          thresholdTokens: 300000,
+          thresholdPercent: 92.0,
+          status: "warn",
+          compactionCount: 5,
+          mtime: 100,
+          transcriptPath: "/tmp/t1.jsonl",
+        },
+        {
+          conversationId: "1db71075-5c2a-466b-b56b-201285d1bfc6",
+          title: "Perform Final Whole-Plugin Review",
+          agentName: "context-guard-reviewer",
+          parentConversationId: "fee5bb10-fea1-4289-9552-dda76eb615c6",
+          isSubagent: true,
+          sourceApp: "antigravity",
+          model: "gemini-4-hydrogen-tiered-xhigh",
+          effectiveTokens: 183900,
+          thresholdTokens: 300000,
+          thresholdPercent: 61.3,
+          status: "ok",
+          compactionCount: 2,
+          mtime: 99,
+          transcriptPath: "/tmp/t2.jsonl",
+        },
+      ],
+      active: null,
+    },
+  });
+
+  let text = collectText(fakeDoc._appEl);
+  assert.ok(text.includes("Context Guard Custom Plugin Development"), text);
+  assert.ok(text.includes("Show Subagents (1)"), text);
+  assert.equal(text.includes("Perform Final Whole-Plugin Review"), false);
+
+  const findBtn = (node, label) => {
+    if (!node) return null;
+    if (node.tagName === "BUTTON" && (node._text || "").includes(label)) return node;
+    for (const c of node.children || []) {
+      const hit = findBtn(c, label);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  const toggleBtn = findBtn(fakeDoc._appEl, "Show Subagents (1)");
+  assert.ok(toggleBtn);
+  toggleBtn.dispatchEvent({ type: "click" });
+
+  text = collectText(fakeDoc._appEl);
+  assert.ok(text.includes("Perform Final Whole-Plugin Review"), text);
+  assert.ok(text.includes("context-guard-reviewer"), text);
+  assert.ok(text.includes("Hide Subagents"), text);
+
+  controller.dispose();
+});
