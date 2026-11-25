@@ -166,6 +166,11 @@ def _sync_conversation_state(
     if status is not None and status.get("stepCount", 0) > 0:
         conv_state["lastTokens"] = status["effectiveTokens"]
         conv_state["lastCompactionIndex"] = status["activeEpochStep"]
+        compaction_count = max(0, int(status.get("compactionCount", 0)))
+        if conv_state.get("warnedAtEpoch", -1) > compaction_count:
+            conv_state["warnedAtEpoch"] = -1
+        if conv_state.get("alertedAtEpoch", -1) > compaction_count:
+            conv_state["alertedAtEpoch"] = -1
         resolved_model = status.get("model") or payload_model
         if resolved_model:
             conv_state["lastModel"] = resolved_model

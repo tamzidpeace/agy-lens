@@ -143,6 +143,7 @@ Settings and per-conversation state are persisted atomically in `~/.gemini/confi
 - `thresholdTokens` (`integer`, min `1000`): Global token alert threshold (default `300000`).
 - `warnPercent` (`integer`, `1`–`99`): Percentage of the effective threshold that triggers early warning (default `80`).
 - `mode` (`"warn" | "stop" | "gate"`): Enforcement behavior when reaching the threshold (default `"stop"`).
+- `autoRefreshSeconds` (`integer`, `1`–`300`): Live dashboard auto-refresh polling interval in seconds (default `5`).
 - `modelWindows` (`object`): Model substring/key to context window size mapping used for the secondary `Model Window` gauge.
 - `conversations.<conversationId>`: Per-session state (`transcriptPath`, `lastCompactionIndex`, `warnedAtEpoch`, `alertedAtEpoch`, `snoozedUntilTokens`, `customThresholdTokens`, `lastTokens`, `lastModel`, `updatedAt`). Automatically pruned above `200` stored entries while retaining the active, custom-threshold, and snoozed sessions.
 
@@ -169,23 +170,23 @@ The `monitor` MCP server exposes the resource `ui://context-guard/dashboard.html
 |---|---|---|---|
 | `context_status` | `aux_pane` (*Context Guard*) | `conversationId?` | Opens the side-pane dashboard for the active (or specified) conversation and returns live token, turn, and bloat telemetry. |
 | `context_overview` | `global` (*Context Guard*) | `limit?` (`1`–`100`, default `20`) | Lists recent conversations across Antigravity App, CLI, and IDE with live usage bars and health pills. |
-| `context_configure` | — | `thresholdTokens?`, `warnPercent?`, `mode?`, `enabled?`, `conversationId?`, `customThresholdTokens?` (`0` clears), `snoozeTokens?`, `resetSnooze?` | Persists global or per-conversation settings and returns updated status. |
+| `context_configure` | — | `thresholdTokens?`, `warnPercent?`, `mode?`, `enabled?`, `autoRefreshSeconds?`, `conversationId?`, `customThresholdTokens?` (`0` clears), `snoozeTokens?`, `resetSnooze?` | Persists global or per-conversation settings and returns updated status. |
 | `context_handoff` | — | `conversationId?`, `note?` | Generates a structured continuation brief for starting a fresh chat cleanly. |
 
 Internal UI-only tools (`visibility: ["app"]`): `app_refresh`, `app_save_settings`, `app_snooze`, and `app_build_handoff`.
 
 ### Dashboard Panels & Controls
 
-- **Header:** Status pill (`OK`, `WARN`, `LIMIT`, `DISABLED`, `NO DATA`), active mode badge, `Overview` / `Detail` toggle, `Refresh`, and `Auto 5s` live polling toggle.
+- **Header:** Status pill (`OK`, `WARN`, `LIMIT`, `DISABLED`, `NO DATA`), active mode badge, `Overview` / `Detail` toggle, `Refresh`, and configurable `Auto 5s` live polling toggle.
 - **Gauges & Metrics:** `Guard Threshold` progress bar (with early-warn tick and estimated turns remaining), `Model Window` bar, and 4 breakdown cards (`Input`, `Cache Read`, `Output`, `Cache Hit %`).
 - **Turn-by-Turn Growth Sparkline:** SVG trajectory across completed `PLANNER_RESPONSE` turns with dashed warn and threshold lines.
 - **Bloat Inspector:** Category distribution (`User`, `Model`, `Tool Outputs`, `System`) plus the top 8 heaviest steps since the latest compaction with tool attribution.
 - **Action Bar (capability-gated via `app.getHostCapabilities()`):**
-  - **Try /compact:** Sends `/compact` to the active conversation via `app.sendMessage`.
+  - **Copy /compact:** Copies `/compact` to the clipboard so you can paste and run it directly in the chat composer (`app.sendMessage` bypasses the client-side slash-command handler).
   - **Snooze +50k / Clear Snooze:** Adds `+50,000` tokens above `max(effectiveTokens, currentThreshold)` or clears active snooze.
   - **Smart Handoff:** Builds a continuation brief (with optional custom note) and sends it directly to a new conversation (`target: "new"`), with one-click **Copy Brief** fallback.
   - **Attach Summary:** Attaches a compact telemetry snapshot via `app.updateModelContext` when supported by the host.
-  - **Settings:** Inline drawer with threshold presets (`150k`, `200k`, `300k`, `500k`), custom token input, warn %, mode switcher (`WARN` / `STOP` / `GATE`), and hook toggle.
+  - **Settings:** Inline drawer with threshold presets (`150k`, `200k`, `300k`, `500k`), custom token input, warn %, mode switcher (`WARN` / `STOP` / `GATE`), configurable auto-refresh interval (`2s`–`60s` presets or `1`–`300s` custom), and hook toggle.
 
 ### Example Chat Prompts
 
@@ -202,7 +203,7 @@ Context Guard addresses this cleanly without trapping your workflow:
 
 1. **Never blocks `/compact`:** Safe slash-command bypass lets you compact anytime, even when `gate` mode has paused the session.
 2. **Clean Turn Stops (`stop` / `gate`):** Prevents runaway multi-turn tool loops from burning past your quality threshold.
-3. **One-Click Recovery:** Use **Try /compact** (dispatched via `app.sendMessage` when supported) or **Smart Handoff** to seamlessly transition into a fresh chat with preserved context before automatic lossy compaction degrades reasoning.
+3. **Fast Recovery:** Use **Copy /compact** (paste & send in the chat box to trigger host compaction) or **Smart Handoff** to seamlessly transition into a fresh chat with preserved context before automatic lossy compaction degrades reasoning.
 
 ## Development & Rebuilding `ui/app.html`
 

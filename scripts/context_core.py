@@ -18,6 +18,9 @@ from typing import Any
 DEFAULT_THRESHOLD_TOKENS = 300_000
 DEFAULT_WARN_PERCENT = 80
 DEFAULT_MODE = "stop"
+DEFAULT_AUTO_REFRESH_SECONDS = 5
+MIN_AUTO_REFRESH_SECONDS = 1
+MAX_AUTO_REFRESH_SECONDS = 300
 VALID_MODES = ("warn", "stop", "gate")
 DEFAULT_MODEL_WINDOWS: dict[str, int] = {
     "gemini-4": 1_048_576,
@@ -56,6 +59,10 @@ _COMMAND_ARG_KEYS = frozenset({"commandline", "command_line", "command", "cmd"})
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 _ADDITIONAL_METADATA_RE = re.compile(
     r"<ADDITIONAL_METADATA>.*?(?:</ADDITIONAL_METADATA>|$)",
+    re.DOTALL,
+)
+_SYSTEM_MESSAGE_WRAPPER_RE = re.compile(
+    r"^The following is a <SYSTEM_MESSAGE>.*?<SYSTEM_MESSAGE>\s*",
     re.DOTALL,
 )
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -202,6 +209,7 @@ def _default_config() -> dict[str, Any]:
         "thresholdTokens": DEFAULT_THRESHOLD_TOKENS,
         "warnPercent": DEFAULT_WARN_PERCENT,
         "mode": DEFAULT_MODE,
+        "autoRefreshSeconds": DEFAULT_AUTO_REFRESH_SECONDS,
         "modelWindows": dict(DEFAULT_MODEL_WINDOWS),
         "lastActiveConversationId": None,
         "conversations": {},
@@ -243,6 +251,13 @@ def load_config() -> dict[str, Any]:
     mode = raw.get("mode")
     if isinstance(mode, str) and mode in VALID_MODES:
         config["mode"] = mode
+
+    refresh_secs = _safe_int(raw.get("autoRefreshSeconds"), 0)
+    if refresh_secs > 0:
+        config["autoRefreshSeconds"] = max(
+            MIN_AUTO_REFRESH_SECONDS,
+            min(MAX_AUTO_REFRESH_SECONDS, refresh_secs),
+        )
 
     raw_windows = raw.get("modelWindows")
     if isinstance(raw_windows, dict):
@@ -869,13 +884,25 @@ def _categorize_step(step_type: str, source: str) -> str:
     return _SOURCE_CATEGORY.get(source, "system")
 
 
+def _detect_compaction_marker(step_type: str, content_text: str) -> str | None:
+    """Identify structural compaction boundary steps without matching prose mentions."""
+    if step_type == "CHECKPOINT":
+        return "checkpoint"
+    if step_type == "SYSTEM_MESSAGE":
+        body = _SYSTEM_MESSAGE_WRAPPER_RE.sub("", content_text, count=1).lstrip()
+        if body.startswith(CONTEXT_SUMMARY_MARKER):
+            return "marker"
+    return None
+
+
 def _summarize_epoch_bloat(
     step_records: list[dict[str, Any]],
     active_epoch_pos: int,
     last_valid_planner_pos: int,
 ) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
     """Compute pending post-response delta, category totals, and top bloat steps."""
-    post_response_start = last_valid_planner_pos + 1 if last_valid_planner_pos >= 0 else 0
+    after_planner = last_valid_planner_pos + 1 if last_valid_planner_pos >= 0 else 0
+    post_response_start = max(active_epoch_pos, after_planner)
     pending_delta = sum(rec["rawContentLen"] // 4 for rec in step_records[post_response_start:])
 
     bloat_by_cat = {"user": 0, "model": 0, "toolOutputs": 0, "system": 0}
@@ -952,7 +979,8 @@ def analyze_transcript(transcript_path: str | Path) -> dict[str, Any]:
         content_text = _text_of(step.get("content"))
         thinking_text = _text_of(step.get("thinking"))
 
-        marker_detected = CONTEXT_SUMMARY_MARKER in content_text
+        marker_reason = _detect_compaction_marker(step_type, content_text)
+        marker_detected = marker_reason is not None
         drop_detected = False
         prior_total: int | None = None
         step_tools: list[str] = []
@@ -1002,10 +1030,9 @@ def analyze_transcript(transcript_path: str | Path) -> dict[str, Any]:
                 prior_total = prev_total
                 if awaiting_post_marker_drop and prompt_tok > 0:
                     awaiting_post_marker_drop = False
-                    if (
-                        prior_total is not None
-                        and prompt_tok < prior_total * COMPACTION_DROP_RATIO
-                        and compactions
+                    if compactions and (
+                        (prior_total is not None and prompt_tok < prior_total * COMPACTION_DROP_RATIO)
+                        or compactions[-1]["newPromptTokens"] == 0
                     ):
                         compactions[-1]["newPromptTokens"] = prompt_tok
                 elif (
@@ -1055,19 +1082,27 @@ def analyze_transcript(transcript_path: str | Path) -> dict[str, Any]:
             snippet_source = content_text
 
         if drop_detected or marker_detected:
+            prev_tokens = prior_total if drop_detected else result["totalTokens"]
+            if marker_detected and not drop_detected:
+                awaiting_post_marker_drop = True
+                # Clear stale pre-compaction telemetry until the next PLANNER_RESPONSE runs.
+                result["inputTokens"] = 0
+                result["cacheReadTokens"] = 0
+                result["outputTokens"] = 0
+                result["promptTokens"] = 0
+                result["totalTokens"] = 0
+
             compactions.append(
                 {
                     "stepIndex": step_index,
-                    "reason": "drop" if drop_detected else "marker",
-                    "prevTotalTokens": prior_total if drop_detected else result["totalTokens"],
-                    "newPromptTokens": result["promptTokens"],
+                    "reason": "drop" if drop_detected else (marker_reason or "marker"),
+                    "prevTotalTokens": prev_tokens,
+                    "newPromptTokens": result["promptTokens"] if drop_detected else 0,
                 }
             )
             result["compactionCount"] += 1
             result["activeEpochStep"] = step_index
             active_epoch_pos = pos
-            if marker_detected and not drop_detected:
-                awaiting_post_marker_drop = True
 
         category = _categorize_step(step_type, source)
         step_records.append(
@@ -1124,6 +1159,17 @@ def _normalize_global_settings(config: dict[str, Any]) -> tuple[bool, str, int, 
     return enabled, mode, threshold_tokens, warn_percent
 
 
+def _normalize_auto_refresh_seconds(config: dict[str, Any]) -> int:
+    """Return sanitized dashboard auto-refresh interval in seconds."""
+    return max(
+        MIN_AUTO_REFRESH_SECONDS,
+        min(
+            MAX_AUTO_REFRESH_SECONDS,
+            _safe_int(config.get("autoRefreshSeconds"), DEFAULT_AUTO_REFRESH_SECONDS),
+        ),
+    )
+
+
 def _status_label(
     *,
     enabled: bool,
@@ -1170,6 +1216,7 @@ def build_status_payload(
     )
 
     enabled, mode, _, warn_percent = _normalize_global_settings(cfg)
+    auto_refresh_seconds = _normalize_auto_refresh_seconds(cfg)
     base_threshold = _resolve_base_threshold(cfg, target_conv_id)
     effective_threshold = resolve_effective_threshold(cfg, target_conv_id)
     warn_threshold = max(1, int(effective_threshold * warn_percent / 100))
@@ -1237,6 +1284,7 @@ def build_status_payload(
             "enabled": enabled,
             "mode": mode,
             "warnPercent": warn_percent,
+            "autoRefreshSeconds": auto_refresh_seconds,
             "baseThresholdTokens": base_threshold,
             "snoozedUntilTokens": snoozed_until,
             "effectiveThresholdTokens": effective_threshold,
@@ -1258,6 +1306,7 @@ def build_overview_payload(
     """Build multi-conversation overview payload across all discovered brain roots."""
     cfg = config if config is not None else load_config()
     enabled, mode, global_threshold, warn_percent = _normalize_global_settings(cfg)
+    auto_refresh_seconds = _normalize_auto_refresh_seconds(cfg)
 
     recent = list_recent_transcripts(limit=limit)
     meta_map = _collect_conv_metadata(
@@ -1305,6 +1354,7 @@ def build_overview_payload(
         "mode": mode,
         "thresholdTokens": global_threshold,
         "warnPercent": warn_percent,
+        "autoRefreshSeconds": auto_refresh_seconds,
         "conversations": summaries,
         "active": active_summary,
     }
@@ -1442,6 +1492,7 @@ def update_settings(
     warn_percent: int | None = None,
     mode: str | None = None,
     enabled: bool | None = None,
+    auto_refresh_seconds: int | None = None,
     conv_id: str | None = None,
     custom_threshold_tokens: int | None = None,
     snooze_delta: int | None = None,
@@ -1503,6 +1554,15 @@ def update_settings(
 
     if enabled is not None:
         config["enabled"] = bool(enabled)
+
+    if auto_refresh_seconds is not None and not isinstance(auto_refresh_seconds, bool):
+        config["autoRefreshSeconds"] = max(
+            MIN_AUTO_REFRESH_SECONDS,
+            min(
+                MAX_AUTO_REFRESH_SECONDS,
+                _safe_int(auto_refresh_seconds, DEFAULT_AUTO_REFRESH_SECONDS),
+            ),
+        )
 
     cached_target_tokens: int | None = None
     if needs_conv and target_conv_id:

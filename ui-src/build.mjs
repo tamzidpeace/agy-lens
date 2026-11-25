@@ -312,7 +312,8 @@ textarea {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: currentColor;
+  flex-shrink: 0;
+  background: var(--color-text-success, var(--cg-text-success));
 }
 
 .cg-card {

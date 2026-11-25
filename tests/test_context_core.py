@@ -350,6 +350,142 @@ class TestTranscriptAnalysis(unittest.TestCase):
             self.assertEqual(result["history"][-1]["stepIndex"], 64)
             self.assertEqual(result["avgDeltaPerTurn"], 2_000)
 
+    def test_checkpoint_resets_stale_tokens_before_next_planner_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.jsonl"
+            entries = [
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Initial task",
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "model": "gemini-4-hydrogen-high",
+                    "input_tokens": 2_900,
+                    "cache_read_tokens": 363_500,
+                    "output_tokens": 1_089,
+                },
+                {
+                    "step_index": 2,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "/compact",
+                },
+                {
+                    "step_index": 3,
+                    "source": "SYSTEM",
+                    "type": "CHECKPOINT",
+                    "status": "DONE",
+                    "input_tokens": 2_944,
+                    "cache_read_tokens": 366_213,
+                    "output_tokens": 3_367,
+                    "content": "# Resuming from a compaction\n\n" + ("x" * 3_968),  # ~1000 est tokens
+                },
+            ]
+            _write_jsonl(transcript, entries)
+
+            immediately_after = core.analyze_transcript(transcript)
+            self.assertEqual(immediately_after["compactionCount"], 1)
+            self.assertEqual(immediately_after["compactions"][0]["reason"], "checkpoint")
+            self.assertEqual(immediately_after["compactions"][0]["prevTotalTokens"], 367_489)
+            self.assertEqual(immediately_after["compactions"][0]["newPromptTokens"], 0)
+            self.assertEqual(immediately_after["totalTokens"], 0)
+            self.assertEqual(immediately_after["activeEpochStep"], 3)
+            self.assertLess(immediately_after["effectiveTokens"], 2_000)
+            self.assertEqual(immediately_after["effectiveTokens"], immediately_after["pendingDeltaTokens"])
+
+            # Subsequent post-compaction PLANNER_RESPONSE updates tokens without double-counting.
+            entries.append(
+                {
+                    "step_index": 4,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "model": "gemini-4-hydrogen-high",
+                    "input_tokens": 30_622,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 812,
+                }
+            )
+            _write_jsonl(transcript, entries)
+            after_turn = core.analyze_transcript(transcript)
+            self.assertEqual(after_turn["compactionCount"], 1)
+            self.assertEqual(after_turn["compactions"][0]["newPromptTokens"], 30_622)
+            self.assertEqual(after_turn["effectiveTokens"], 31_434)
+
+    def test_prose_context_summary_mentions_not_counted_as_compactions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.jsonl"
+            entries = [
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Why did <CONTEXT_SUMMARY> trigger here?",
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "model": "gemini-4-hydrogen-high",
+                    "input_tokens": 50_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 500,
+                    "content": "We check `<CONTEXT_SUMMARY>` in parser.",
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "grep hit: marker_detected = '<CONTEXT_SUMMARY>' in line",
+                },
+                {
+                    "step_index": 3,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": (
+                        "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+                        "<SYSTEM_MESSAGE>\n"
+                        "[Message] sender=subagent content=Review mentioned `<CONTEXT_SUMMARY>` handling"
+                    ),
+                },
+            ]
+            _write_jsonl(transcript, entries)
+
+            result = core.analyze_transcript(transcript)
+            self.assertEqual(result["compactionCount"], 0)
+            self.assertEqual(result["compactions"], [])
+
+            # Real wrapped <CONTEXT_SUMMARY> SYSTEM_MESSAGE still counts once.
+            entries.append(
+                {
+                    "step_index": 4,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": (
+                        "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+                        "<SYSTEM_MESSAGE>\n"
+                        "<CONTEXT_SUMMARY>Summary body</CONTEXT_SUMMARY>"
+                    ),
+                }
+            )
+            _write_jsonl(transcript, entries)
+            with_real_marker = core.analyze_transcript(transcript)
+            self.assertEqual(with_real_marker["compactionCount"], 1)
+            self.assertEqual(with_real_marker["compactions"][0]["reason"], "marker")
+
 
 class TestConfigAndState(unittest.TestCase):
     def test_epoch_dedup_sentinel_and_snooze_rearm(self) -> None:
@@ -365,6 +501,7 @@ class TestConfigAndState(unittest.TestCase):
                 self.assertEqual(cfg["thresholdTokens"], core.DEFAULT_THRESHOLD_TOKENS)
                 self.assertEqual(cfg["warnPercent"], core.DEFAULT_WARN_PERCENT)
                 self.assertEqual(cfg["mode"], core.DEFAULT_MODE)
+                self.assertEqual(cfg["autoRefreshSeconds"], core.DEFAULT_AUTO_REFRESH_SECONDS)
 
                 conv = core.get_conversation_state(cfg, "c1")
                 self.assertEqual(conv["warnedAtEpoch"], -1)
@@ -409,9 +546,21 @@ class TestConfigAndState(unittest.TestCase):
                     core.update_settings(updated, mode="invalid")
 
                 # Clamping check
-                clamped = core.update_settings(updated, threshold_tokens=10, warn_percent=120)
+                clamped = core.update_settings(
+                    updated,
+                    threshold_tokens=10,
+                    warn_percent=120,
+                    auto_refresh_seconds=999,
+                )
                 self.assertEqual(clamped["thresholdTokens"], 1_000)
                 self.assertEqual(clamped["warnPercent"], 99)
+                self.assertEqual(clamped["autoRefreshSeconds"], core.MAX_AUTO_REFRESH_SECONDS)
+
+                custom_refresh = core.update_settings(updated, auto_refresh_seconds=2)
+                self.assertEqual(custom_refresh["autoRefreshSeconds"], 2)
+                self.assertEqual(core.load_config()["autoRefreshSeconds"], 2)
+                min_refresh = core.update_settings(updated, auto_refresh_seconds=0)
+                self.assertEqual(min_refresh["autoRefreshSeconds"], core.MIN_AUTO_REFRESH_SECONDS)
 
                 # Invalid paths in find_transcript_path fail closed (return None) without raising
                 conv["transcriptPath"] = "/tmp/\x00invalid"

@@ -53,6 +53,7 @@ export interface StatusPayload {
   enabled: boolean;
   mode: GuardMode;
   warnPercent: number;
+  autoRefreshSeconds?: number;
   model: string;
   effectiveTokens: number;
   inputTokens: number;
@@ -100,6 +101,7 @@ export interface OverviewPayload {
   mode: GuardMode;
   thresholdTokens: number;
   warnPercent: number;
+  autoRefreshSeconds?: number;
   conversations: OverviewConversation[];
   active: OverviewConversation | null;
 }
@@ -158,6 +160,8 @@ export interface MountDependencies {
   applyStyles?: (styles: McpUiStyles, root?: HTMLElement) => void;
   applyFonts?: (fontCss: string) => void;
   autoFetchDelayMs?: number;
+  autoRefresh?: boolean;
+  autoRefreshIntervalMs?: number;
 }
 
 export interface DashboardController {
@@ -179,6 +183,7 @@ interface SettingsDraft {
   thresholdTokens: number;
   warnPercent: number;
   mode: GuardMode;
+  autoRefreshSeconds?: number;
 }
 
 interface BannerState {
@@ -190,6 +195,7 @@ interface DashboardState {
   connected: boolean;
   loading: boolean;
   autoRefresh: boolean;
+  autoRefreshSeconds: number;
   currentView: ViewMode;
   userSwitchedView: boolean;
   hasInitialToolResult: boolean;
@@ -211,7 +217,10 @@ interface DashboardState {
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const AUTO_REFRESH_INTERVAL_MS = 5000;
+const DEFAULT_AUTO_REFRESH_SECONDS = 5;
+const MIN_AUTO_REFRESH_SECONDS = 1;
+const MAX_AUTO_REFRESH_SECONDS = 300;
+const AUTO_REFRESH_PRESETS = [2, 5, 10, 30, 60] as const;
 const SNOOZE_STEP_TOKENS = 50_000;
 const MIN_THRESHOLD_TOKENS = 1_000;
 const THRESHOLD_PRESETS = [150_000, 200_000, 300_000, 500_000] as const;
@@ -242,6 +251,20 @@ export function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;")
     .replace(/`/g, "&#96;");
+}
+
+/** Clamp an auto-refresh interval (in seconds) within safe bounds. */
+export function normalizeAutoRefreshSeconds(
+  value: unknown,
+  fallback = DEFAULT_AUTO_REFRESH_SECONDS,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(
+    MIN_AUTO_REFRESH_SECONDS,
+    Math.min(MAX_AUTO_REFRESH_SECONDS, Math.round(value)),
+  );
 }
 
 /** Check whether an unknown value is a non-null plain record. */
@@ -388,26 +411,23 @@ export function createToolMutex<A extends unknown[], R>(
   activeCount: () => number;
 } {
   let tail: Promise<void> = Promise.resolve();
-  let active = 0;
+  let pending = 0;
 
   return {
     run(getArgs: () => A): Promise<R> {
-      const task = tail.then(async () => {
-        active += 1;
-        try {
-          return await executor(...getArgs());
-        } finally {
-          active -= 1;
-        }
+      pending += 1;
+      const task = tail.then(async () => executor(...getArgs()));
+      const settled = task.finally(() => {
+        pending -= 1;
       });
-      tail = task.then(
+      tail = settled.then(
         () => undefined,
         () => undefined,
       );
-      return task;
+      return settled;
     },
-    isBusy: () => active > 0,
-    activeCount: () => active,
+    isBusy: () => pending > 0,
+    activeCount: () => pending,
   };
 }
 
@@ -714,16 +734,19 @@ function renderHeader(
     }),
   );
 
-  const autoBtn = createButton(doc, "Auto 5s", {
+  const autoLabel = `Auto ${state.autoRefreshSeconds}s`;
+  const autoBtn = createButton(doc, state.autoRefresh ? "" : autoLabel, {
     className: state.autoRefresh
       ? "cg-btn cg-btn-sm cg-btn-active"
       : "cg-btn cg-btn-sm",
     disabled: !canServerTools,
-    title: "Toggle 5-second auto-refresh",
+    title: state.autoRefresh
+      ? `Auto-refreshing every ${state.autoRefreshSeconds}s (click to pause; interval in Settings)`
+      : `${state.autoRefreshSeconds}-second auto-refresh paused (click to enable; interval in Settings)`,
     onClick: onToggleAuto,
   });
   if (state.autoRefresh) {
-    autoBtn.insertBefore(el(doc, "span", "cg-dot"), autoBtn.firstChild);
+    autoBtn.append(el(doc, "span", "cg-dot"), autoLabel);
   }
   controls.appendChild(autoBtn);
 
@@ -1203,11 +1226,8 @@ function renderActionBar(
   const canUpdateContext = Boolean(caps?.updateModelContext);
 
   bar.appendChild(
-    createButton(doc, "Try /compact", {
-      disabled: !canMessage,
-      title: canMessage
-        ? "Send /compact command to chat"
-        : "Host does not support message capability",
+    createButton(doc, "Copy /compact", {
+      title: "Copy /compact command to paste into the chat input box",
       onClick: () => {
         void controller.triggerCompact();
       },
@@ -1456,6 +1476,43 @@ function renderSettingsDrawer(
   modeField.appendChild(el(doc, "div", "cg-muted", MODE_DESCRIPTIONS[draft.mode]));
   card.appendChild(modeField);
 
+  const refreshSeconds = draft.autoRefreshSeconds ?? state.autoRefreshSeconds;
+  const refreshField = el(doc, "div", "cg-field");
+  refreshField.appendChild(el(doc, "span", "cg-label", "Auto-Refresh Interval (seconds)"));
+  const refreshPresetRow = el(doc, "div", "cg-preset-row");
+  for (const secs of AUTO_REFRESH_PRESETS) {
+    const active = refreshSeconds === secs;
+    refreshPresetRow.appendChild(
+      createButton(doc, `${secs}s`, {
+        className: active ? "cg-btn cg-btn-sm cg-btn-active" : "cg-btn cg-btn-sm",
+        onClick: () => {
+          draft.autoRefreshSeconds = secs;
+          onDraftChanged();
+        },
+      }),
+    );
+  }
+  refreshField.appendChild(refreshPresetRow);
+
+  const refreshInputRow = el(doc, "div", "cg-field-row");
+  refreshInputRow.appendChild(el(doc, "label", "cg-muted", "Custom (1-300s)"));
+  const refreshInput = el(doc, "input", "cg-input cg-nums");
+  refreshInput.type = "number";
+  refreshInput.min = String(MIN_AUTO_REFRESH_SECONDS);
+  refreshInput.max = String(MAX_AUTO_REFRESH_SECONDS);
+  refreshInput.step = "1";
+  refreshInput.value = String(refreshSeconds);
+  refreshInput.setAttribute("aria-label", "Auto-Refresh Interval (seconds)");
+  refreshInput.addEventListener("input", () => {
+    const parsed = Number.parseInt(refreshInput.value, 10);
+    if (Number.isFinite(parsed)) {
+      draft.autoRefreshSeconds = parsed;
+    }
+  });
+  refreshInputRow.appendChild(refreshInput);
+  refreshField.appendChild(refreshInputRow);
+  card.appendChild(refreshField);
+
   const footer = el(doc, "div", "cg-actions");
   const canServerTools = Boolean(state.hostCapabilities?.serverTools);
   footer.appendChild(
@@ -1625,6 +1682,7 @@ function syncDraftFromStatus(state: DashboardState, status: StatusPayload): void
     thresholdTokens: status.baseThresholdTokens || status.effectiveThresholdTokens,
     warnPercent: status.warnPercent,
     mode: status.mode,
+    autoRefreshSeconds: state.autoRefreshSeconds,
   };
 }
 
@@ -1638,6 +1696,7 @@ function syncDraftFromOverview(
     thresholdTokens: overview.thresholdTokens,
     warnPercent: overview.warnPercent,
     mode: overview.mode,
+    autoRefreshSeconds: state.autoRefreshSeconds,
   };
 }
 
@@ -1657,7 +1716,8 @@ export async function mountDashboard(
   const state: DashboardState = {
     connected: false,
     loading: false,
-    autoRefresh: false,
+    autoRefresh: deps.autoRefresh ?? true,
+    autoRefreshSeconds: DEFAULT_AUTO_REFRESH_SECONDS,
     currentView: "status",
     userSwitchedView: false,
     hasInitialToolResult: false,
@@ -1675,6 +1735,7 @@ export async function mountDashboard(
       thresholdTokens: 300_000,
       warnPercent: 80,
       mode: "stop",
+      autoRefreshSeconds: DEFAULT_AUTO_REFRESH_SECONDS,
     },
     banner: null,
     hostCapabilities: undefined,
@@ -1693,6 +1754,39 @@ export async function mountDashboard(
       initialFallbackTimer = null;
     }
   };
+
+  const stopAutoRefreshTimer = (): void => {
+    if (autoRefreshTimer !== null) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  };
+
+  const startAutoRefreshTimer = (): void => {
+    stopAutoRefreshTimer();
+    if (!state.autoRefresh || disposed || !state.hostCapabilities?.serverTools) {
+      return;
+    }
+    const intervalMs = Math.max(
+      10,
+      deps.autoRefreshIntervalMs ?? state.autoRefreshSeconds * 1000,
+    );
+    autoRefreshTimer = setInterval(() => {
+      if (disposed || doc.hidden || state.settingsOpen || state.handoffOpen) {
+        return;
+      }
+      void controller.refreshCurrentView(true);
+    }, intervalMs);
+  };
+
+  const onVisibilityChange = (): void => {
+    if (!disposed && !doc.hidden && state.autoRefresh && state.hostCapabilities?.serverTools) {
+      if (!state.settingsOpen && !state.handoffOpen) {
+        void controller.refreshCurrentView(true);
+      }
+    }
+  };
+  doc.addEventListener?.("visibilitychange", onVisibilityChange);
 
   const applyHostContext = (ctx: McpUiHostContext | undefined): void => {
     if (!ctx) return;
@@ -1773,6 +1867,13 @@ export async function mountDashboard(
     options: { switchView?: boolean } = {},
   ): void => {
     if (isStatusPayload(sc)) {
+      const prevSecs = state.autoRefreshSeconds;
+      if (typeof sc.autoRefreshSeconds === "number") {
+        state.autoRefreshSeconds = normalizeAutoRefreshSeconds(
+          sc.autoRefreshSeconds,
+          state.autoRefreshSeconds,
+        );
+      }
       state.statusData = sc;
       if (sc.conversationId) {
         state.activeConversationId = sc.conversationId;
@@ -1781,9 +1882,24 @@ export async function mountDashboard(
       if (options.switchView !== false) {
         state.currentView = "status";
       }
+      if (
+        state.autoRefreshSeconds !== prevSecs &&
+        state.autoRefresh &&
+        state.hostCapabilities?.serverTools &&
+        !disposed
+      ) {
+        startAutoRefreshTimer();
+      }
       return;
     }
     if (isOverviewPayload(sc)) {
+      const prevSecs = state.autoRefreshSeconds;
+      if (typeof sc.autoRefreshSeconds === "number") {
+        state.autoRefreshSeconds = normalizeAutoRefreshSeconds(
+          sc.autoRefreshSeconds,
+          state.autoRefreshSeconds,
+        );
+      }
       state.overviewData = sc;
       if (!state.activeConversationId && sc.active?.conversationId) {
         state.activeConversationId = sc.active.conversationId;
@@ -1793,6 +1909,14 @@ export async function mountDashboard(
       }
       if (options.switchView !== false) {
         state.currentView = "overview";
+      }
+      if (
+        state.autoRefreshSeconds !== prevSecs &&
+        state.autoRefresh &&
+        state.hostCapabilities?.serverTools &&
+        !disposed
+      ) {
+        startAutoRefreshTimer();
       }
       return;
     }
@@ -1829,15 +1953,14 @@ export async function mountDashboard(
     dispose(): void {
       disposed = true;
       clearInitialFallbackTimer();
-      if (autoRefreshTimer !== null) {
-        clearInterval(autoRefreshTimer);
-        autoRefreshTimer = null;
-      }
+      stopAutoRefreshTimer();
+      doc.removeEventListener?.("visibilitychange", onVisibilityChange);
     },
 
     async refreshCurrentView(skipIfBusy = false): Promise<void> {
+      const requestedView = state.currentView;
       const args: Record<string, unknown> =
-        state.currentView === "overview"
+        requestedView === "overview"
           ? { view: "overview", limit: state.overviewLimit }
           : {
               view: "status",
@@ -1850,7 +1973,9 @@ export async function mountDashboard(
         showLoading: !skipIfBusy,
       });
       if (res?.structuredContent) {
-        applyStructuredResult(res.structuredContent, { switchView: true });
+        applyStructuredResult(res.structuredContent, {
+          switchView: !skipIfBusy || state.currentView === requestedView,
+        });
         render();
       }
     },
@@ -1917,36 +2042,16 @@ export async function mountDashboard(
     },
 
     async triggerCompact(): Promise<void> {
-      if (!state.hostCapabilities?.message) {
-        state.banner = {
-          kind: "error",
-          text: "Host does not support sending chat messages.",
-        };
-        render();
-        return;
-      }
-      try {
-        const res = await app.sendMessage({
-          role: "user",
-          content: [{ type: "text", text: "/compact" }],
-        });
-        if (res?.isError) {
-          state.banner = {
-            kind: "error",
-            text: "Host rejected /compact message.",
-          };
-        } else {
-          state.banner = {
+      const copied = await copyPlainText(doc, "/compact");
+      state.banner = copied
+        ? {
             kind: "success",
-            text: "Sent /compact to conversation.",
+            text: 'Copied "/compact" — paste & send it in the chat box to compact (MCP Apps cannot run slash commands directly).',
+          }
+        : {
+            kind: "info",
+            text: "Type /compact in the chat box and press Enter to compact (MCP Apps cannot run slash commands directly).",
           };
-        }
-      } catch (err) {
-        state.banner = {
-          kind: "error",
-          text: extractToolErrorText(err, "Failed to send /compact"),
-        };
-      }
       render();
     },
 
@@ -2042,6 +2147,10 @@ export async function mountDashboard(
     async saveSettings(draft: SettingsDraft): Promise<void> {
       const thresh = Math.round(draft.thresholdTokens);
       const warnPct = Math.round(draft.warnPercent);
+      const hasRefreshSeconds = draft.autoRefreshSeconds !== undefined;
+      const refreshSecs = hasRefreshSeconds
+        ? Math.round(draft.autoRefreshSeconds as number)
+        : state.autoRefreshSeconds;
       if (!Number.isFinite(thresh) || thresh < MIN_THRESHOLD_TOKENS) {
         state.banner = {
           kind: "error",
@@ -2058,6 +2167,19 @@ export async function mountDashboard(
         render();
         return;
       }
+      if (
+        hasRefreshSeconds &&
+        (!Number.isFinite(refreshSecs) ||
+          refreshSecs < MIN_AUTO_REFRESH_SECONDS ||
+          refreshSecs > MAX_AUTO_REFRESH_SECONDS)
+      ) {
+        state.banner = {
+          kind: "error",
+          text: `Auto-refresh interval must be between ${MIN_AUTO_REFRESH_SECONDS} and ${MAX_AUTO_REFRESH_SECONDS} seconds.`,
+        };
+        render();
+        return;
+      }
 
       const args: Record<string, unknown> = {
         enabled: draft.enabled,
@@ -2065,6 +2187,9 @@ export async function mountDashboard(
         warnPercent: warnPct,
         mode: draft.mode,
       };
+      if (hasRefreshSeconds) {
+        args.autoRefreshSeconds = refreshSecs;
+      }
       if (state.activeConversationId) {
         args.conversationId = state.activeConversationId;
       }
@@ -2072,6 +2197,15 @@ export async function mountDashboard(
       const res = await invokeServerTool("app_save_settings", args);
       if (!res?.structuredContent) return;
 
+      if (hasRefreshSeconds) {
+        state.autoRefreshSeconds = normalizeAutoRefreshSeconds(
+          refreshSecs,
+          state.autoRefreshSeconds,
+        );
+        if (state.autoRefresh && state.hostCapabilities?.serverTools && !disposed) {
+          startAutoRefreshTimer();
+        }
+      }
       applyStructuredResult(res.structuredContent, {
         switchView: state.currentView === "status",
       });
@@ -2094,26 +2228,53 @@ export async function mountDashboard(
     },
   };
 
-  const copyBrief = async (textarea: HTMLTextAreaElement): Promise<void> => {
-    const text = textarea.value;
-    let copied = false;
+  const copyPlainText = async (
+    targetDoc: Document,
+    text: string,
+    selectSource?: HTMLTextAreaElement,
+  ): Promise<boolean> => {
     try {
       if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);
-        copied = true;
+        return true;
       }
     } catch {
-      copied = false;
+      // Fall through to execCommand fallback below.
     }
-    if (!copied) {
-      textarea.focus?.();
-      textarea.select();
+
+    if (selectSource) {
+      selectSource.focus?.();
+      selectSource.select();
       try {
-        copied = doc.execCommand("copy");
+        return targetDoc.execCommand("copy");
       } catch {
-        copied = false;
+        return false;
       }
     }
+
+    const body = targetDoc.body;
+    if (!body) return false;
+    try {
+      const temp = targetDoc.createElement("textarea") as HTMLTextAreaElement;
+      temp.value = text;
+      temp.setAttribute("readonly", "");
+      if (temp.style) {
+        temp.style.position = "fixed";
+        temp.style.opacity = "0";
+      }
+      body.appendChild(temp);
+      temp.focus?.();
+      temp.select?.();
+      const ok = Boolean(targetDoc.execCommand?.("copy"));
+      body.removeChild?.(temp);
+      return ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const copyBrief = async (textarea: HTMLTextAreaElement): Promise<void> => {
+    const copied = await copyPlainText(doc, textarea.value, textarea);
     state.banner = copied
       ? { kind: "success", text: "Handoff brief copied to clipboard." }
       : { kind: "info", text: "Brief selected — press Cmd/Ctrl+C to copy." };
@@ -2122,17 +2283,13 @@ export async function mountDashboard(
 
   const toggleAutoRefresh = (): void => {
     state.autoRefresh = !state.autoRefresh;
-    if (autoRefreshTimer !== null) {
-      clearInterval(autoRefreshTimer);
-      autoRefreshTimer = null;
-    }
     if (state.autoRefresh && !disposed) {
-      autoRefreshTimer = setInterval(() => {
-        if (disposed || doc.hidden || state.settingsOpen || state.handoffOpen) {
-          return;
-        }
+      startAutoRefreshTimer();
+      if (!doc.hidden && !state.settingsOpen && !state.handoffOpen) {
         void controller.refreshCurrentView(true);
-      }, AUTO_REFRESH_INTERVAL_MS);
+      }
+    } else {
+      stopAutoRefreshTimer();
     }
     render();
   };
@@ -2161,6 +2318,7 @@ export async function mountDashboard(
               state.statusData.effectiveThresholdTokens,
             warnPercent: state.statusData.warnPercent,
             mode: state.statusData.mode,
+            autoRefreshSeconds: state.autoRefreshSeconds,
           };
         } else if (state.overviewData) {
           state.settingsDraft = {
@@ -2168,6 +2326,7 @@ export async function mountDashboard(
             thresholdTokens: state.overviewData.thresholdTokens,
             warnPercent: state.overviewData.warnPercent,
             mode: state.overviewData.mode,
+            autoRefreshSeconds: state.autoRefreshSeconds,
           };
         }
       }
@@ -2318,6 +2477,9 @@ export async function mountDashboard(
     state.connected = true;
     state.hostCapabilities = app.getHostCapabilities();
     applyHostContext(app.getHostContext());
+    if (state.autoRefresh && state.hostCapabilities?.serverTools && !disposed) {
+      startAutoRefreshTimer();
+    }
     render();
     if (state.hasInitialToolResult && state.currentView === "status") {
       prefetchOverviewOnce();

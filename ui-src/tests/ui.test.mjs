@@ -98,6 +98,12 @@ function createFakeElement(tagName) {
       children.push(child);
       return child;
     },
+    insertBefore(newNode, refNode) {
+      const idx = refNode ? children.indexOf(refNode) : -1;
+      if (idx === -1) children.push(newNode);
+      else children.splice(idx, 0, newNode);
+      return newNode;
+    },
     append(...nodes) {
       for (const n of nodes) {
         if (typeof n === "string") {
@@ -154,6 +160,7 @@ function createFakeDocument() {
     getElementById: (id) => (id === "app" ? appEl : null),
     querySelectorAll: () => [],
     addEventListener: () => {},
+    removeEventListener: () => {},
     execCommand: () => false,
     _appEl: appEl,
   };
@@ -573,9 +580,12 @@ test("capability gating, snooze, settings validation, toolcancelled, and hostcon
   fakeApp._handlers.ontoolresult({ content: [], structuredContent: baseStatus });
 
   const buttons = collectButtons(fakeDoc._appEl);
-  const compactBtn = buttons.find((b) => b.textContent === "Try /compact");
-  assert.ok(compactBtn, "Try /compact button should render");
-  assert.equal(compactBtn.disabled, true, "Try /compact must be disabled without caps.message");
+  const compactBtn = buttons.find((b) => b.textContent === "Copy /compact");
+  assert.ok(compactBtn, "Copy /compact button should render");
+  assert.equal(compactBtn.disabled, false, "Copy /compact stays enabled without caps.message");
+  await controller.triggerCompact();
+  assert.equal(sentCount, 0, "Copy /compact must not send /compact via sendMessage");
+  assert.ok(collectText(fakeDoc._appEl).includes("chat box"));
 
   const attachBtn = buttons.find((b) => b.textContent === "Attach Summary");
   assert.equal(attachBtn, undefined, "Attach Summary must not render without caps.updateModelContext");
@@ -748,6 +758,7 @@ test("compiled ui/app.html boots bundled ext-apps App and completes MCP ui/initi
   };
 
   const vmTimers = new Set();
+  const vmIntervals = new Set();
   const context = vm.createContext({
     window: sandboxWindow,
     document: fakeDoc,
@@ -761,8 +772,15 @@ test("compiled ui/app.html boots bundled ext-apps App and completes MCP ui/initi
       vmTimers.delete(id);
       clearTimeout(id);
     },
-    setInterval,
-    clearInterval,
+    setInterval: (cb, ms, ...args) => {
+      const id = setInterval(cb, ms, ...args);
+      vmIntervals.add(id);
+      return id;
+    },
+    clearInterval: (id) => {
+      vmIntervals.delete(id);
+      clearInterval(id);
+    },
     requestAnimationFrame: (cb) => {
       const id = setTimeout(cb, 0);
       vmTimers.add(id);
@@ -790,6 +808,7 @@ test("compiled ui/app.html boots bundled ext-apps App and completes MCP ui/initi
     assert.ok(rendered.includes("gemini-4-hydrogen-high"));
   } finally {
     for (const id of vmTimers) clearTimeout(id);
+    for (const id of vmIntervals) clearInterval(id);
   }
 });
 
@@ -894,6 +913,230 @@ test("overview renders conversation titles and toggles subagent filter", async (
   assert.ok(text.includes("Perform Final Whole-Plugin Review"), text);
   assert.ok(text.includes("context-guard-reviewer"), text);
   assert.ok(text.includes("Hide Subagents"), text);
+
+  controller.dispose();
+});
+
+test("auto-refresh starts active by default, polls on interval, toggles off/on, and disposes", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  let refreshCount = 0;
+
+  const sampleStatus = {
+    view: "status",
+    conversationId: "conv-auto",
+    status: "ok",
+    enabled: true,
+    mode: "stop",
+    warnPercent: 80,
+    model: "gemini-4-hydrogen-high",
+    effectiveTokens: 42000,
+    inputTokens: 12000,
+    cacheReadTokens: 28000,
+    outputTokens: 2000,
+    pendingDeltaTokens: 0,
+    cacheHitPercent: 70.0,
+    effectiveThresholdTokens: 300000,
+    warnThresholdTokens: 240000,
+    baseThresholdTokens: 300000,
+    snoozedUntilTokens: 0,
+    modelWindowTokens: 1048576,
+    thresholdPercent: 14.0,
+    windowPercent: 4.0,
+    remainingToThreshold: 258000,
+    avgDeltaPerTurn: 10000,
+    estimatedTurnsRemaining: 25,
+    compactionCount: 0,
+    history: [{ stepIndex: 1, totalTokens: 42000, deltaTokens: 42000 }],
+    bloatByCategory: { user: 1000, model: 5000, toolOutputs: 36000, system: 0 },
+    topBloatSteps: [],
+  };
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      if (params.name === "app_refresh" && params.arguments?.view === "status") {
+        refreshCount += 1;
+        return {
+          content: [{ type: "text", text: "Status" }],
+          structuredContent: {
+            ...sampleStatus,
+            effectiveTokens: 42000 + refreshCount * 1000,
+          },
+        };
+      }
+      return { content: [], structuredContent: {} };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefreshIntervalMs: 20,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  fakeApp.ontoolresult({ content: [], structuredContent: sampleStatus });
+  const initialAutoBtn = collectButtons(fakeDoc._appEl).find((b) =>
+    (b.textContent || "").includes("Auto 5s"),
+  );
+  assert.ok(initialAutoBtn);
+  assert.ok(
+    initialAutoBtn.className.includes("cg-btn-active"),
+    "Auto 5s must be active by default",
+  );
+
+  await new Promise((r) => setTimeout(r, 75));
+  assert.ok(refreshCount >= 2, `expected interval auto-refreshes, got ${refreshCount}`);
+
+  // Pause auto-refresh
+  const activeBtn = collectButtons(fakeDoc._appEl).find((b) =>
+    (b.textContent || "").includes("Auto 5s"),
+  );
+  activeBtn.dispatchEvent({ type: "click" });
+  const pausedCount = refreshCount;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(refreshCount, pausedCount, "paused Auto 5s must not poll");
+
+  // Resume triggers immediate refresh + resumes polling
+  const pausedBtn = collectButtons(fakeDoc._appEl).find((b) =>
+    (b.textContent || "").includes("Auto 5s"),
+  );
+  pausedBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(refreshCount > pausedCount, "enabling Auto 5s triggers immediate refresh");
+
+  controller.dispose();
+});
+
+test("auto-refresh interval setting validates bounds, persists via app_save_settings, and updates header label", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const savedCalls = [];
+
+  const statusPayload = {
+    view: "status",
+    conversationId: "conv-interval",
+    status: "ok",
+    enabled: true,
+    mode: "stop",
+    warnPercent: 80,
+    autoRefreshSeconds: 5,
+    model: "gemini-4-hydrogen-high",
+    effectiveTokens: 42000,
+    inputTokens: 12000,
+    cacheReadTokens: 28000,
+    outputTokens: 2000,
+    pendingDeltaTokens: 0,
+    cacheHitPercent: 70.0,
+    effectiveThresholdTokens: 300000,
+    warnThresholdTokens: 240000,
+    baseThresholdTokens: 300000,
+    snoozedUntilTokens: 0,
+    modelWindowTokens: 1048576,
+    thresholdPercent: 14.0,
+    windowPercent: 4.0,
+    remainingToThreshold: 258000,
+    avgDeltaPerTurn: 10000,
+    estimatedTurnsRemaining: 25,
+    compactionCount: 0,
+    history: [{ stepIndex: 1, totalTokens: 42000, deltaTokens: 42000 }],
+    bloatByCategory: { user: 1000, model: 5000, toolOutputs: 36000, system: 0 },
+    topBloatSteps: [],
+  };
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      if (params.name === "app_save_settings") {
+        savedCalls.push(params.arguments);
+        return {
+          content: [{ type: "text", text: "Saved" }],
+          structuredContent: {
+            ...statusPayload,
+            autoRefreshSeconds: params.arguments.autoRefreshSeconds ?? 5,
+          },
+        };
+      }
+      return { content: [], structuredContent: statusPayload };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  fakeApp.ontoolresult({ content: [], structuredContent: statusPayload });
+
+  // Open Settings drawer and inspect Auto-Refresh Interval presets + custom input
+  const settingsBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Settings");
+  assert.ok(settingsBtn);
+  settingsBtn.dispatchEvent({ type: "click" });
+
+  const preset10s = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "10s");
+  const preset2s = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "2s");
+  assert.ok(preset2s && preset10s, "Auto-refresh preset buttons (2s, 10s, ...) must render in Settings");
+
+  // Click 2s preset then Save Settings
+  preset2s.dispatchEvent({ type: "click" });
+  const saveBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Save Settings");
+  assert.ok(saveBtn);
+  saveBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.equal(savedCalls.length, 1);
+  assert.equal(savedCalls[0].autoRefreshSeconds, 2);
+  const updatedAutoBtn = collectButtons(fakeDoc._appEl).find((b) =>
+    (b.textContent || "").includes("Auto 2s"),
+  );
+  assert.ok(updatedAutoBtn, "Header auto-refresh button must update to Auto 2s");
+
+  // Invalid autoRefreshSeconds is rejected before calling server tool
+  await controller.saveSettings({
+    enabled: true,
+    thresholdTokens: 300000,
+    warnPercent: 80,
+    mode: "stop",
+    autoRefreshSeconds: 0,
+  });
+  assert.equal(savedCalls.length, 1);
+  assert.ok(collectText(fakeDoc._appEl).includes("between 1 and 300 seconds"));
 
   controller.dispose();
 });

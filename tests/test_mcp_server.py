@@ -512,11 +512,17 @@ class TestMcpServer(unittest.TestCase):
                 # Save settings via app-only tool and refresh status
                 save_res = mcp_server.call_tool(
                     "app_save_settings",
-                    {"thresholdTokens": 280_000, "mode": "stop", "enabled": True},
+                    {
+                        "thresholdTokens": 280_000,
+                        "mode": "stop",
+                        "enabled": True,
+                        "autoRefreshSeconds": 12,
+                    },
                 )
                 self.assertNotIn("isError", save_res)
                 self.assertEqual(save_res["structuredContent"]["effectiveThresholdTokens"], 280_000)
                 self.assertEqual(save_res["structuredContent"]["mode"], "stop")
+                self.assertEqual(save_res["structuredContent"]["autoRefreshSeconds"], 12)
 
                 refresh_res = mcp_server.call_tool(
                     "app_refresh",
@@ -525,6 +531,7 @@ class TestMcpServer(unittest.TestCase):
                 self.assertNotIn("isError", refresh_res)
                 self.assertEqual(refresh_res["structuredContent"]["view"], "status")
                 self.assertEqual(refresh_res["structuredContent"]["effectiveThresholdTokens"], 280_000)
+                self.assertEqual(refresh_res["structuredContent"]["autoRefreshSeconds"], 12)
 
                 # Handoff brief (both model/app and app-only tools)
                 handoff_res = mcp_server.call_tool(
@@ -550,6 +557,11 @@ class TestMcpServer(unittest.TestCase):
 
                 bad_mode = mcp_server.call_tool("context_configure", {"mode": "explode"})
                 self.assertIs(bad_mode.get("isError"), True)
+
+                bad_refresh_secs = mcp_server.call_tool("context_configure", {"autoRefreshSeconds": 0})
+                self.assertIs(bad_refresh_secs.get("isError"), True)
+                too_slow_secs = mcp_server.call_tool("app_save_settings", {"autoRefreshSeconds": 999})
+                self.assertIs(too_slow_secs.get("isError"), True)
 
                 bad_delta = mcp_server.call_tool(
                     "app_snooze",

@@ -131,6 +131,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Enable or disable Context Guard lifecycle hooks.",
                 },
+                "autoRefreshSeconds": {
+                    "type": "integer",
+                    "minimum": context_core.MIN_AUTO_REFRESH_SECONDS,
+                    "maximum": context_core.MAX_AUTO_REFRESH_SECONDS,
+                    "description": "Dashboard auto-refresh polling interval in seconds (default 5, range 1-300).",
+                },
                 "conversationId": {
                     "type": "string",
                     "description": "Target conversation ID for per-conversation threshold or snooze changes.",
@@ -194,6 +200,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "warnPercent": {"type": "integer", "minimum": 1, "maximum": 99},
                 "mode": {"type": "string", "enum": list(context_core.VALID_MODES)},
                 "enabled": {"type": "boolean"},
+                "autoRefreshSeconds": {
+                    "type": "integer",
+                    "minimum": context_core.MIN_AUTO_REFRESH_SECONDS,
+                    "maximum": context_core.MAX_AUTO_REFRESH_SECONDS,
+                },
                 "conversationId": {"type": "string"},
                 "customThresholdTokens": {"type": "integer", "minimum": 0},
                 "resetSnooze": {"type": "boolean"},
@@ -435,6 +446,12 @@ def _handle_configure(arguments: dict[str, Any], request_meta: dict[str, Any]) -
     warn_percent = _optional_int(arguments, "warnPercent", min_value=1, max_value=99)
     mode = _optional_str(arguments, "mode")
     enabled = _optional_bool(arguments, "enabled")
+    auto_refresh_seconds = _optional_int(
+        arguments,
+        "autoRefreshSeconds",
+        min_value=context_core.MIN_AUTO_REFRESH_SECONDS,
+        max_value=context_core.MAX_AUTO_REFRESH_SECONDS,
+    )
     custom_threshold = _optional_int(arguments, "customThresholdTokens", min_value=0)
     snooze_delta = _optional_int(arguments, "snoozeTokens", min_value=0)
     if snooze_delta is None:
@@ -450,6 +467,7 @@ def _handle_configure(arguments: dict[str, Any], request_meta: dict[str, Any]) -
         warn_percent=warn_percent,
         mode=mode,
         enabled=enabled,
+        auto_refresh_seconds=auto_refresh_seconds,
         conv_id=conv_id,
         custom_threshold_tokens=custom_threshold,
         snooze_delta=snooze_delta,
@@ -460,7 +478,8 @@ def _handle_configure(arguments: dict[str, Any], request_meta: dict[str, Any]) -
     summary = (
         f"Context Guard settings saved: enabled={status['enabled']}, "
         f"mode={status['mode']}, effectiveThreshold={status['effectiveThresholdTokens']:,}, "
-        f"warnPercent={status['warnPercent']}%, snoozedUntil={status['snoozedUntilTokens']:,}."
+        f"warnPercent={status['warnPercent']}%, autoRefresh={status['autoRefreshSeconds']}s, "
+        f"snoozedUntil={status['snoozedUntilTokens']:,}."
     )
     return _tool_result(summary, status)
 
