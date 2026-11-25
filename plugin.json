@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "context-guard",
+  "displayName": "Context Guard",
+  "version": "1.0.0",
+  "description": "Real-time context window monitor, bloat inspector, and configurable threshold guard with a live side-pane dashboard and one-click session handoff.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Show my current context window usage and what is eating tokens",
+    "Set my Context Guard alert threshold to 300k tokens",
+    "Prepare a clean handoff brief to continue this task in a fresh chat"
+  ],
+  "author": {
+    "name": "Arafat",
+    "url": "https://github.com/tamzidpeace"
+  },
+  "homepage": "https://github.com/tamzidpeace/context-guard",
+  "repository": "https://github.com/tamzidpeace/context-guard",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "tokens",
+    "compaction",
+    "monitoring",
+    "dashboard",
+    "handoff"
+  ]
+}

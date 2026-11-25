@@ -1,0 +1,21 @@
+{
+  "name": "ui-src",
+  "version": "1.0.0",
+  "description": "MCP App dashboard source for Context Guard",
+  "main": "src/main.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node build.mjs",
+    "test": "node --test tests/ui.test.mjs"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
