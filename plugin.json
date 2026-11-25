@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-context-guard",
   "displayName": "Context Guard",
-  "version": "1.0.0",
+  "version": "1.0.0-beta.1",
   "description": "Real-time context window monitor, bloat inspector, and configurable threshold guard with a live side-pane dashboard and one-click session handoff.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
