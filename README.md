@@ -6,6 +6,12 @@
 
 Real-time context window monitor, token bloat inspector, and configurable threshold guard for **Antigravity** (Desktop App, CLI `agy`, and IDE), featuring a live interactive MCP App dashboard and one-click Smart Handoff.
 
+## Screenshots *(Example Data)*
+
+| Side-Pane Detail View | Multi-Conversation Overview |
+|---|---|
+| <img src="assets/screenshot-detail.png" width="340" alt="Context Guard detail dashboard showing token gauges, turn-by-turn sparkline, bloat inspector, and actions" /> | <img src="assets/screenshot-overview.png" width="460" alt="Context Guard overview listing recent conversations with live token usage bars and compaction counts" /> |
+
 ---
 
 ## Why Context Guard?
@@ -38,7 +44,9 @@ agy-context-guard/
 ├── hooks.json                  # SessionStart, PreInvocation, PostInvocation, Stop hooks
 ├── README.md                   # Documentation
 ├── assets/
-│   └── logo.svg                # 128x128 plugin icon
+│   ├── logo.svg                # 128x128 plugin icon
+│   ├── screenshot-detail.png   # Side-pane detail dashboard preview
+│   └── screenshot-overview.png # Multi-conversation overview preview
 ├── scripts/
 │   ├── context_core.py         # Transcript analyzer, config store, bloat & handoff engine
 │   └── hook.py                 # Fail-open lifecycle hook entrypoint
@@ -173,12 +181,13 @@ The `monitor` MCP server exposes the resource `ui://context-guard/dashboard.html
 | `context_configure` | — | `thresholdTokens?`, `warnPercent?`, `mode?`, `enabled?`, `autoRefreshSeconds?`, `conversationId?`, `customThresholdTokens?` (`0` clears), `snoozeTokens?`, `resetSnooze?` | Persists global or per-conversation settings and returns updated status. |
 | `context_handoff` | — | `conversationId?`, `note?` | Generates a structured continuation brief for starting a fresh chat cleanly. |
 
-Internal UI-only tools (`visibility: ["app"]`): `app_refresh`, `app_save_settings`, `app_snooze`, and `app_build_handoff`.
+Internal UI-only tools (`visibility: ["app"]`): `app_refresh`, `app_save_settings`, `app_snooze`, `app_build_handoff`, and `app_quota`.
 
 ### Dashboard Panels & Controls
 
 - **Header:** Status pill (`OK`, `WARN`, `LIMIT`, `DISABLED`, `NO DATA`), active mode badge, `Overview` / `Detail` toggle, `Refresh`, and configurable `Auto 5s` live polling toggle.
 - **Gauges & Metrics:** `Guard Threshold` progress bar (with early-warn tick and estimated turns remaining), `Model Window` bar, and 4 breakdown cards (`Input`, `Cache Read`, `Output`, `Cache Hit %`).
+- **Model Quotas (All-in-One Usage & Limits):** Non-blocking background tracker powered by Antigravity CLI's official `agy -p /usage --output-format json` command, displaying 5-hour and weekly remaining percentages, circular gauges, live reset countdowns (`Resets in ...`), and model pools (`Gemini Models`, `Claude and GPT models`) with a one-click `Refresh Limits` trigger and persistent local cache (`context-guard-quota.json`).
 - **Turn-by-Turn Growth Sparkline:** SVG trajectory across completed `PLANNER_RESPONSE` turns with dashed warn and threshold lines.
 - **Bloat Inspector:** Category distribution (`User`, `Model`, `Tool Outputs`, `System`) plus the top 8 heaviest steps since the latest compaction with tool attribution.
 - **Action Bar (capability-gated via `app.getHostCapabilities()`):**

@@ -1140,3 +1140,178 @@ test("auto-refresh interval setting validates bounds, persists via app_save_sett
 
   controller.dispose();
 });
+
+test("model quotas card renders 5h and weekly limits, countdowns, and triggers non-blocking refresh", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const calls = [];
+
+  const nowMs = Date.now();
+  const reset5h = new Date(nowMs + 4 * 3600 * 1000 + 11 * 60 * 1000).toISOString();
+  const resetWeekly = new Date(nowMs + 6 * 86400 * 1000 + 23 * 3600 * 1000).toISOString();
+  assert.equal(mod.formatQuotaReset(reset5h, 62, nowMs), "Resets in 4h 11m");
+  assert.equal(mod.formatQuotaReset(resetWeekly, 89, nowMs), "Resets in 6d 23h");
+  assert.equal(mod.formatQuotaReset(reset5h, 100, nowMs), "");
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      calls.push(params);
+      if (params.name === "app_quota") {
+        return {
+          content: [{ type: "text", text: "Quota updated" }],
+          structuredContent: {
+            view: "quota",
+            modelQuota: {
+              available: true,
+              status: "ok",
+              fetchedAt: Math.floor(nowMs / 1000),
+              ageSeconds: 0,
+              fetching: false,
+              groups: [
+                {
+                  name: "Gemini Models",
+                  modelsSummary: "Gemini 4 Hydrogen, Gemini 3.8 Flash",
+                  buckets: [
+                    {
+                      id: "gemini-5h",
+                      window: "5h",
+                      label: "5h limit",
+                      remainingFraction: 0.61,
+                      remainingPercent: 61,
+                      resetTime: reset5h,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+      }
+      return { content: [], structuredContent: {} };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefresh: false,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  fakeApp.ontoolresult({
+    content: [],
+    structuredContent: {
+      view: "status",
+      conversationId: "conv-quota",
+      status: "ok",
+      enabled: true,
+      mode: "stop",
+      warnPercent: 80,
+      model: "gemini-4-hydrogen-high",
+      effectiveTokens: 42000,
+      inputTokens: 12000,
+      cacheReadTokens: 28000,
+      outputTokens: 2000,
+      pendingDeltaTokens: 0,
+      cacheHitPercent: 70.0,
+      effectiveThresholdTokens: 300000,
+      warnThresholdTokens: 240000,
+      baseThresholdTokens: 300000,
+      snoozedUntilTokens: 0,
+      modelWindowTokens: 1048576,
+      thresholdPercent: 14.0,
+      windowPercent: 4.0,
+      remainingToThreshold: 258000,
+      avgDeltaPerTurn: 10000,
+      estimatedTurnsRemaining: 25,
+      compactionCount: 0,
+      history: [{ stepIndex: 1, totalTokens: 42000, deltaTokens: 42000 }],
+      bloatByCategory: { user: 1000, model: 5000, toolOutputs: 36000, system: 0 },
+      topBloatSteps: [],
+      modelQuota: {
+        available: true,
+        status: "ok",
+        fetchedAt: Math.floor(nowMs / 1000) - 90,
+        ageSeconds: 90,
+        fetching: false,
+        groups: [
+          {
+            name: "Gemini Models",
+            modelsSummary: "Gemini 4 Hydrogen, Gemini 3.8 Flash",
+            buckets: [
+              {
+                id: "gemini-5h",
+                window: "5h",
+                label: "5h limit",
+                remainingFraction: 0.62,
+                remainingPercent: 62,
+                resetTime: reset5h,
+              },
+              {
+                id: "gemini-weekly",
+                window: "weekly",
+                label: "Weekly limit",
+                remainingFraction: 0.89,
+                remainingPercent: 89,
+                resetTime: resetWeekly,
+              },
+            ],
+          },
+          {
+            name: "Claude and GPT models",
+            modelsSummary: "Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
+            buckets: [
+              {
+                id: "3p-5h",
+                window: "5h",
+                label: "5h limit",
+                remainingFraction: 1,
+                remainingPercent: 100,
+                resetTime: reset5h,
+              },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  const text = collectText(fakeDoc._appEl);
+  assert.ok(text.includes("Model Quotas"));
+  assert.ok(text.includes("Gemini Models"));
+  assert.ok(text.includes("62% left"));
+  assert.ok(text.includes("89% left"));
+  assert.ok(text.includes("100% left"));
+  assert.ok(text.includes("Claude and GPT models"));
+
+  const refreshQuotaBtn = collectButtons(fakeDoc._appEl).find(
+    (b) => b.textContent === "Refresh Limits",
+  );
+  assert.ok(refreshQuotaBtn);
+  refreshQuotaBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+
+  const quotaCall = calls.find((c) => c.name === "app_quota");
+  assert.deepEqual(quotaCall, { name: "app_quota", arguments: { refresh: true } });
+  assert.ok(collectText(fakeDoc._appEl).includes("61% left"));
+
+  controller.dispose();
+});

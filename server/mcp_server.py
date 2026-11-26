@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Any, Callable, TextIO
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "scripts")
@@ -271,6 +273,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "app_quota",
+        "description": "Return cached Antigravity model quota limits and optionally trigger a background refresh.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh": {"type": "boolean"},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            },
+        },
+    },
 ]
 
 
@@ -419,12 +437,62 @@ def _format_overview_summary(overview: dict[str, Any]) -> str:
     )
 
 
+_QUOTA_LOCK = threading.Lock()
+_QUOTA_FETCHING = False
+_QUOTA_LAST_ATTEMPT_TS = -1e9
+_QUOTA_AUTO_COOLDOWN_SECONDS = 30.0
+
+
+def _run_quota_fetch_worker() -> None:
+    """Background worker that refreshes Antigravity model quota without blocking RPC."""
+    global _QUOTA_FETCHING
+    try:
+        context_core.fetch_model_quota()
+    except Exception:
+        pass
+    finally:
+        with _QUOTA_LOCK:
+            _QUOTA_FETCHING = False
+
+
+def get_quota_snapshot(*, trigger_if_stale: bool = False, force: bool = False) -> dict[str, Any]:
+    """Return cached model quota immediately and optionally spawn one non-blocking refresh."""
+    global _QUOTA_FETCHING, _QUOTA_LAST_ATTEMPT_TS
+    cache = context_core.load_quota_cache()
+    disable_auto = os.environ.get("CONTEXT_GUARD_DISABLE_AUTO_QUOTA") == "1"
+    now_mono = time.monotonic()
+    should_spawn = False
+
+    with _QUOTA_LOCK:
+        if not _QUOTA_FETCHING:
+            if force:
+                should_spawn = True
+            elif (
+                trigger_if_stale
+                and cache.get("stale")
+                and not disable_auto
+                and (now_mono - _QUOTA_LAST_ATTEMPT_TS) >= _QUOTA_AUTO_COOLDOWN_SECONDS
+            ):
+                should_spawn = True
+
+        if should_spawn:
+            _QUOTA_FETCHING = True
+            _QUOTA_LAST_ATTEMPT_TS = now_mono
+            thread = threading.Thread(target=_run_quota_fetch_worker, daemon=True)
+            thread.start()
+
+        cache["fetching"] = _QUOTA_FETCHING
+
+    return cache
+
+
 def _handle_status(arguments: dict[str, Any], request_meta: dict[str, Any]) -> dict[str, Any]:
     """Handle context_status and status-mode app_refresh tool calls."""
     _optional_str(arguments, "conversationId")
     config = context_core.load_config()
     conv_id = resolve_conversation_id(arguments, request_meta, config)
     payload = context_core.build_status_payload(conv_id=conv_id, config=config)
+    payload["modelQuota"] = get_quota_snapshot(trigger_if_stale=True)
     return _tool_result(_format_status_summary(payload), payload)
 
 
@@ -436,6 +504,7 @@ def _handle_overview(arguments: dict[str, Any], _request_meta: dict[str, Any]) -
         config=config,
         limit=limit if limit is not None else DEFAULT_OVERVIEW_LIMIT,
     )
+    payload["modelQuota"] = get_quota_snapshot(trigger_if_stale=True)
     return _tool_result(_format_overview_summary(payload), payload)
 
 
@@ -545,6 +614,18 @@ def _handle_handoff(arguments: dict[str, Any], request_meta: dict[str, Any]) -> 
     return _tool_result(brief_payload["brief"], brief_payload)
 
 
+def _handle_quota(arguments: dict[str, Any], _request_meta: dict[str, Any]) -> dict[str, Any]:
+    """Handle app_quota tool calls for immediate cached quota + optional background refresh."""
+    force_refresh = bool(_optional_bool(arguments, "refresh"))
+    snapshot = get_quota_snapshot(trigger_if_stale=not force_refresh, force=force_refresh)
+    groups = snapshot.get("groups", [])
+    if groups:
+        summary = f"Model Quota ({snapshot.get('status', 'ok')}): {len(groups)} group(s) loaded."
+    else:
+        summary = f"Model Quota ({snapshot.get('status', 'idle')})."
+    return _tool_result(summary, {"view": "quota", "modelQuota": snapshot})
+
+
 _TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
     "context_status": _handle_status,
     "context_overview": _handle_overview,
@@ -554,6 +635,7 @@ _TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, A
     "app_snooze": _handle_snooze,
     "app_refresh": _handle_refresh,
     "app_build_handoff": _handle_handoff,
+    "app_quota": _handle_quota,
 }
 
 

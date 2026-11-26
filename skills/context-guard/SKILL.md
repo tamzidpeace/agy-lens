@@ -21,7 +21,7 @@ Call the model-visible tools from the `monitor` server based on user intent:
 | Change threshold, warn %, mode, hooks, auto-refresh, or snooze | `context_configure` | `thresholdTokens?` (`>= 1000`), `warnPercent?` (`1`–`99`), `mode?` (`"warn"` \| `"stop"` \| `"gate"`), `enabled?`, `autoRefreshSeconds?` (`1`–`300`), `conversationId?`, `customThresholdTokens?` (`0` clears), `snoozeTokens?`, `resetSnooze?` | Atomically updates `~/.gemini/config/context-guard.json` and returns refreshed status. |
 | Prepare a fresh-chat continuation prompt | `context_handoff` | `conversationId?`, `note?` | Generates a structured `# Session Continuation Handoff` brief from the original goal, recent prompts, files touched, commands run, and current metrics. |
 
-> **Note:** `app_refresh`, `app_save_settings`, `app_snooze`, and `app_build_handoff` are internal UI-only tools (`visibility: ["app"]`). Use only the four `context_*` tools above.
+> **Note:** `app_refresh`, `app_save_settings`, `app_snooze`, `app_build_handoff`, and `app_quota` are internal UI-only tools (`visibility: ["app"]`). Use only the four `context_*` tools above.
 
 ## Enforcement Modes
 

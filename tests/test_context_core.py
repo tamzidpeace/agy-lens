@@ -868,5 +868,86 @@ class TestHandoff(unittest.TestCase):
             self.assertNotIn("<USER_REQUEST>", brief)
 
 
+class TestModelQuota(unittest.TestCase):
+    def test_parse_agy_usage_json_and_cache(self) -> None:
+        sample_raw = json.dumps(
+            {
+                "conversation_id": "",
+                "status": "SUCCESS",
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "description": "Shared quota pools.",
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "description": "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 0.85,
+                                        "reset_time": "2026-12-02T22:36:29Z",
+                                    },
+                                    {
+                                        "id": "gemini-5h",
+                                        "name": "Five Hour Limit Remaining",
+                                        "window": "5h",
+                                        "remaining_fraction": 0.51,
+                                        "reset_time": "2026-11-26T03:36:29Z",
+                                    },
+                                ],
+                            },
+                            {
+                                "name": "Claude and GPT models",
+                                "description": "Models within this group: Claude Sonnet 4.6, Claude Opus 4.6",
+                                "buckets": [
+                                    {
+                                        "id": "3p-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 1.0,
+                                        "reset_time": "2026-12-03T00:00:00Z",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        parsed = core.parse_agy_usage_json(sample_raw, fetched_at=1_700_000_000)
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["status"], "ok")
+        self.assertEqual(len(parsed["groups"]), 2)
+        gemini = parsed["groups"][0]
+        self.assertEqual(gemini["modelsSummary"], "Gemini 4 Hydrogen, Gemini 3.8 Flash")
+        # 5h bucket is sorted before weekly
+        self.assertEqual(gemini["buckets"][0]["label"], "5h limit")
+        self.assertEqual(gemini["buckets"][0]["remainingPercent"], 51.0)
+        self.assertEqual(gemini["buckets"][1]["label"], "Weekly limit")
+        self.assertEqual(gemini["buckets"][1]["remainingPercent"], 85.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            quota_path = Path(tmp) / "quota.json"
+            fake_cli = Path(tmp) / "agy"
+            fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_cli.chmod(0o755)
+            env = {
+                "CONTEXT_GUARD_QUOTA_PATH": str(quota_path),
+                "ANTIGRAVITY_CLI_PATH": str(fake_cli),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                completed = mock.Mock(returncode=0, stdout=sample_raw, stderr="")
+                with mock.patch.object(core.subprocess, "run", return_value=completed):
+                    fetched = core.fetch_model_quota()
+                self.assertEqual(fetched["status"], "ok")
+                self.assertTrue(quota_path.is_file())
+                cached = core.load_quota_cache(ttl_seconds=300, now_ts=fetched["fetchedAt"] + 10)
+                self.assertFalse(cached["stale"])
+                self.assertEqual(cached["groups"][0]["buckets"][0]["remainingPercent"], 51.0)
+
+
 if __name__ == "__main__":
     unittest.main()

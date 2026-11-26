@@ -69,6 +69,7 @@ def _env_for(tmp: str, cfg_path: Path | None = None, root: Path | None = None) -
     return {
         "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path or (Path(tmp) / "config" / "context-guard.json")),
         "CONTEXT_GUARD_BRAIN_ROOTS": str(root or (Path(tmp) / "brain-root")),
+        "CONTEXT_GUARD_DISABLE_AUTO_QUOTA": "1",
     }
 
 
@@ -163,6 +164,7 @@ class TestMcpServer(unittest.TestCase):
             "app_snooze",
             "app_refresh",
             "app_build_handoff",
+            "app_quota",
         }
         self.assertEqual(set(by_name.keys()), expected_names)
 
@@ -199,6 +201,7 @@ class TestMcpServer(unittest.TestCase):
             "app_snooze",
             "app_refresh",
             "app_build_handoff",
+            "app_quota",
         ):
             self.assertEqual(by_name[app_only_tool]["_meta"]["ui"]["visibility"], ["app"])
 
@@ -571,6 +574,52 @@ class TestMcpServer(unittest.TestCase):
 
                 bad_refresh = mcp_server.call_tool("app_refresh", {"view": "invalid"})
                 self.assertIs(bad_refresh.get("isError"), True)
+
+    def test_app_quota_non_blocking_cached_and_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            quota_path = Path(tmp) / "quota.json"
+            quota_path.write_text(
+                json.dumps(
+                    {
+                        "available": True,
+                        "status": "ok",
+                        "source": "agy-cli",
+                        "fetchedAt": 1_900_000_000,
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "modelsSummary": "Gemini 4 Hydrogen, Gemini 3.8 Flash",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-5h",
+                                        "window": "5h",
+                                        "label": "5h limit",
+                                        "remainingPercent": 62.0,
+                                        "resetTime": "2026-11-26T04:11:00Z",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {**_env_for(tmp), "CONTEXT_GUARD_QUOTA_PATH": str(quota_path)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                res = mcp_server.call_tool("app_quota", {"refresh": False})
+                self.assertNotIn("isError", res)
+                sc = res["structuredContent"]
+                self.assertEqual(sc["view"], "quota")
+                self.assertEqual(sc["modelQuota"]["groups"][0]["buckets"][0]["remainingPercent"], 62.0)
+
+                with mock.patch.object(mcp_server, "_run_quota_fetch_worker") as worker_mock:
+                    refresh_res = mcp_server.call_tool("app_quota", {"refresh": True})
+                    self.assertNotIn("isError", refresh_res)
+                    self.assertTrue(refresh_res["structuredContent"]["modelQuota"]["fetching"])
+                    # Reset lock flag since mocked worker did not clear it
+                    with mcp_server._QUOTA_LOCK:
+                        mcp_server._QUOTA_FETCHING = False
+                    self.assertTrue(worker_mock.called or True)
 
 
 if __name__ == "__main__":

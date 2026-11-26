@@ -42,6 +42,34 @@ export interface BloatByCategory {
   system: number;
 }
 
+export interface QuotaBucket {
+  id: string;
+  window: string;
+  label: string;
+  remainingFraction: number;
+  remainingPercent: number;
+  resetTime: string;
+}
+
+export interface QuotaGroup {
+  name: string;
+  modelsSummary?: string;
+  buckets: QuotaBucket[];
+}
+
+export interface ModelQuotaPayload {
+  available: boolean;
+  status: "ok" | "unavailable" | "error" | "idle";
+  source?: string;
+  fetchedAt?: number;
+  stale?: boolean;
+  fetching?: boolean;
+  ageSeconds?: number | null;
+  description?: string;
+  groups: QuotaGroup[];
+  error?: string;
+}
+
 export interface StatusPayload {
   view: "status";
   conversationId: string | null;
@@ -76,6 +104,7 @@ export interface StatusPayload {
   history: HistoryPoint[];
   bloatByCategory: BloatByCategory;
   topBloatSteps: BloatStep[];
+  modelQuota?: ModelQuotaPayload;
 }
 
 export interface OverviewConversation {
@@ -104,6 +133,7 @@ export interface OverviewPayload {
   autoRefreshSeconds?: number;
   conversations: OverviewConversation[];
   active: OverviewConversation | null;
+  modelQuota?: ModelQuotaPayload;
 }
 
 export interface HandoffPayload {
@@ -174,6 +204,7 @@ export interface DashboardController {
   triggerCompact: () => Promise<void>;
   triggerHandoff: (note?: string, autoSend?: boolean) => Promise<void>;
   triggerAttachSummary: () => Promise<void>;
+  refreshQuota: () => Promise<void>;
   saveSettings: (draft: SettingsDraft) => Promise<void>;
   showStatusView: () => void;
 }
@@ -203,6 +234,7 @@ interface DashboardState {
   overviewLimit: number;
   statusData: StatusPayload | null;
   overviewData: OverviewPayload | null;
+  quotaData: ModelQuotaPayload | null;
   handoffData: HandoffPayload | null;
   handoffSentToNewChat: boolean;
   handoffNote: string;
@@ -293,6 +325,38 @@ export function isOverviewPayload(value: unknown): value is OverviewPayload {
 /** Validate a HandoffPayload structuredContent object from mcp_server.py. */
 export function isHandoffPayload(value: unknown): value is HandoffPayload {
   return isRecord(value) && typeof value.brief === "string";
+}
+
+/** Format ISO reset timestamp into a concise "Resets in ..." string when active. */
+export function formatQuotaReset(
+  resetTimeIso: string | undefined,
+  remainingPercent: number,
+  nowMs = Date.now(),
+): string {
+  if (!resetTimeIso || remainingPercent >= 99.95) return "";
+  const targetMs = Date.parse(resetTimeIso);
+  if (!Number.isFinite(targetMs)) return "";
+  const diffSec = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
+  if (diffSec < 60) return "Resetting soon";
+  const totalMins = Math.floor(diffSec / 60);
+  const days = Math.floor(totalMins / (24 * 60));
+  const hours = Math.floor((totalMins % (24 * 60)) / 60);
+  const mins = totalMins % 60;
+  if (days > 0) return `Resets in ${days}d ${hours}h`;
+  if (hours > 0) return `Resets in ${hours}h ${mins}m`;
+  return `Resets in ${mins}m`;
+}
+
+/** Format cached quota age concisely ("just now", "2m ago", "1h ago"). */
+export function formatQuotaAge(ageSeconds: number | null | undefined): string {
+  if (typeof ageSeconds !== "number" || !Number.isFinite(ageSeconds) || ageSeconds < 0) {
+    return "";
+  }
+  if (ageSeconds < 60) return "just now";
+  const mins = Math.floor(ageSeconds / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ago`;
 }
 
 /** Extract concise error text from an MCP CallToolResult or Error. */
@@ -997,6 +1061,135 @@ function renderMetricGrid(doc: Document, status: StatusPayload): HTMLElement {
     grid.appendChild(card);
   }
   return grid;
+}
+
+function isQuotaPayload(value: unknown): value is ModelQuotaPayload {
+  return isRecord(value) && Array.isArray(value.groups) && typeof value.status === "string";
+}
+
+function quotaRingStroke(remainingPercent: number): string {
+  if (remainingPercent < 20) return "var(--color-text-danger, var(--cg-text-danger))";
+  if (remainingPercent < 50) return "var(--color-text-warning, var(--cg-text-warning))";
+  return "var(--color-text-success, var(--cg-text-success))";
+}
+
+function renderQuotaRing(doc: Document, remainingPercent: number): SVGElement {
+  const clamped = Math.max(0, Math.min(100, remainingPercent));
+  const r = 6.5;
+  const circ = 2 * Math.PI * r;
+  const offset = circ * (1 - clamped / 100);
+  const svg = svgEl(doc, "svg", {
+    viewBox: "0 0 18 18",
+    class: "cg-quota-ring",
+    role: "img",
+    "aria-label": `${Math.round(clamped)}% remaining`,
+  });
+  svg.appendChild(
+    svgEl(doc, "circle", {
+      cx: 9,
+      cy: 9,
+      r,
+      fill: "none",
+      stroke: "var(--cg-track)",
+      "stroke-width": "2.2",
+    }),
+  );
+  svg.appendChild(
+    svgEl(doc, "circle", {
+      cx: 9,
+      cy: 9,
+      r,
+      fill: "none",
+      stroke: quotaRingStroke(clamped),
+      "stroke-width": "2.2",
+      "stroke-linecap": "round",
+      "stroke-dasharray": circ.toFixed(2),
+      "stroke-dashoffset": offset.toFixed(2),
+      transform: "rotate(-90 9 9)",
+    }),
+  );
+  return svg;
+}
+
+function renderModelQuotaCard(
+  doc: Document,
+  quota: ModelQuotaPayload,
+  state: DashboardState,
+  controller: DashboardController,
+): HTMLElement {
+  const card = el(doc, "section", "cg-card");
+  const head = el(doc, "div", "cg-card-head");
+  head.appendChild(el(doc, "span", "cg-card-title", "Model Quotas"));
+
+  const controls = el(doc, "div", "cg-header-controls");
+  const ageLabel = quota.fetching
+    ? "Syncing..."
+    : quota.fetchedAt
+      ? formatQuotaAge(quota.ageSeconds)
+      : quota.status === "unavailable"
+        ? "CLI missing"
+        : "Not synced";
+  if (ageLabel) {
+    controls.appendChild(el(doc, "span", "cg-muted", ageLabel));
+  }
+  const canServerTools = Boolean(state.hostCapabilities?.serverTools);
+  controls.appendChild(
+    createButton(doc, quota.fetching ? "Checking..." : "Refresh Limits", {
+      className: "cg-btn cg-btn-sm",
+      disabled: !canServerTools || Boolean(quota.fetching),
+      title: "Refresh Antigravity 5h and weekly model usage limits via agy CLI",
+      onClick: () => {
+        void controller.refreshQuota();
+      },
+    }),
+  );
+  head.appendChild(controls);
+  card.appendChild(head);
+
+  if (quota.groups.length === 0) {
+    const msg = quota.fetching
+      ? "Checking Antigravity 5h and weekly model usage limits..."
+      : quota.error || "Click Refresh Limits to load Antigravity 5h and weekly model quotas.";
+    card.appendChild(el(doc, "div", "cg-muted", msg));
+    return card;
+  }
+
+  const grid = el(doc, "div", "cg-quota-grid");
+  for (const group of quota.groups) {
+    const box = el(doc, "div", "cg-quota-group");
+    const gHead = el(doc, "div", "cg-quota-group-head");
+    gHead.appendChild(el(doc, "div", "cg-quota-group-title", group.name));
+    if (group.modelsSummary) {
+      gHead.appendChild(el(doc, "div", "cg-quota-models", group.modelsSummary));
+    }
+    box.appendChild(gHead);
+
+    for (const bucket of group.buckets) {
+      const row = el(doc, "div", "cg-quota-row");
+      const left = el(doc, "div", "cg-quota-left");
+      left.appendChild(el(doc, "span", "cg-quota-label", bucket.label));
+      const resetText = formatQuotaReset(bucket.resetTime, bucket.remainingPercent);
+      if (resetText) {
+        left.appendChild(el(doc, "span", "cg-quota-reset", resetText));
+      }
+
+      const right = el(doc, "div", "cg-quota-right cg-nums");
+      right.appendChild(
+        el(doc, "span", "cg-quota-pct", `${Math.round(bucket.remainingPercent)}% left`),
+      );
+      right.appendChild(renderQuotaRing(doc, bucket.remainingPercent));
+      row.append(left, right);
+      box.appendChild(row);
+    }
+
+    grid.appendChild(box);
+  }
+  card.appendChild(grid);
+
+  if (quota.status === "error" && quota.error) {
+    card.appendChild(el(doc, "div", "cg-muted", `Showing cached limits (${quota.error})`));
+  }
+  return card;
 }
 
 function renderSparklineCard(doc: Document, status: StatusPayload): HTMLElement {
@@ -1725,6 +1918,7 @@ export async function mountDashboard(
     overviewLimit: 20,
     statusData: null,
     overviewData: null,
+    quotaData: null,
     handoffData: null,
     handoffSentToNewChat: false,
     handoffNote: "",
@@ -1746,6 +1940,8 @@ export async function mountDashboard(
 
   let initialFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   let autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let quotaPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let quotaPollAttempts = 0;
   let disposed = false;
 
   const clearInitialFallbackTimer = (): void => {
@@ -1753,6 +1949,37 @@ export async function mountDashboard(
       clearTimeout(initialFallbackTimer);
       initialFallbackTimer = null;
     }
+  };
+
+  const stopQuotaPollTimer = (): void => {
+    if (quotaPollTimer !== null) {
+      clearTimeout(quotaPollTimer);
+      quotaPollTimer = null;
+    }
+  };
+
+  const scheduleQuotaPollIfFetching = (): void => {
+    stopQuotaPollTimer();
+    if (
+      disposed ||
+      !state.quotaData?.fetching ||
+      !state.hostCapabilities?.serverTools ||
+      quotaPollAttempts >= 12
+    ) {
+      return;
+    }
+    const delayMs = Math.max(50, deps.autoRefreshIntervalMs ? deps.autoRefreshIntervalMs : 2500);
+    quotaPollTimer = setTimeout(() => {
+      quotaPollAttempts += 1;
+      void invokeServerTool("app_quota", { refresh: false }, { skipIfBusy: true, showLoading: false }).then(
+        (res) => {
+          if (res?.structuredContent) {
+            applyStructuredResult(res.structuredContent, { switchView: false });
+            render();
+          }
+        },
+      );
+    }, delayMs);
   };
 
   const stopAutoRefreshTimer = (): void => {
@@ -1874,6 +2101,11 @@ export async function mountDashboard(
           state.autoRefreshSeconds,
         );
       }
+      if (isQuotaPayload(sc.modelQuota)) {
+        state.quotaData = sc.modelQuota;
+        if (!sc.modelQuota.fetching) quotaPollAttempts = 0;
+        scheduleQuotaPollIfFetching();
+      }
       state.statusData = sc;
       if (sc.conversationId) {
         state.activeConversationId = sc.conversationId;
@@ -1900,6 +2132,11 @@ export async function mountDashboard(
           state.autoRefreshSeconds,
         );
       }
+      if (isQuotaPayload(sc.modelQuota)) {
+        state.quotaData = sc.modelQuota;
+        if (!sc.modelQuota.fetching) quotaPollAttempts = 0;
+        scheduleQuotaPollIfFetching();
+      }
       state.overviewData = sc;
       if (!state.activeConversationId && sc.active?.conversationId) {
         state.activeConversationId = sc.active.conversationId;
@@ -1918,6 +2155,12 @@ export async function mountDashboard(
       ) {
         startAutoRefreshTimer();
       }
+      return;
+    }
+    if (isRecord(sc) && sc.view === "quota" && isQuotaPayload(sc.modelQuota)) {
+      state.quotaData = sc.modelQuota;
+      if (!sc.modelQuota.fetching) quotaPollAttempts = 0;
+      scheduleQuotaPollIfFetching();
       return;
     }
     if (isHandoffPayload(sc)) {
@@ -1954,6 +2197,7 @@ export async function mountDashboard(
       disposed = true;
       clearInitialFallbackTimer();
       stopAutoRefreshTimer();
+      stopQuotaPollTimer();
       doc.removeEventListener?.("visibilitychange", onVisibilityChange);
     },
 
@@ -2142,6 +2386,19 @@ export async function mountDashboard(
         };
       }
       render();
+    },
+
+    async refreshQuota(): Promise<void> {
+      quotaPollAttempts = 0;
+      const res = await invokeServerTool(
+        "app_quota",
+        { refresh: true },
+        { showLoading: false },
+      );
+      if (res?.structuredContent) {
+        applyStructuredResult(res.structuredContent, { switchView: false });
+        render();
+      }
     },
 
     async saveSettings(draft: SettingsDraft): Promise<void> {
@@ -2360,7 +2617,7 @@ export async function mountDashboard(
     if (state.currentView === "overview" && state.overviewData) {
       if (settingsNode) shell.appendChild(settingsNode);
       if (handoffNode) shell.appendChild(handoffNode);
-      for (const node of renderOverviewView(
+      const overviewNodes = renderOverviewView(
         doc,
         state.overviewData,
         state,
@@ -2370,7 +2627,14 @@ export async function mountDashboard(
           state.hideSubagents = !state.hideSubagents;
           render();
         },
-      )) {
+      );
+      if (overviewNodes.length > 0) {
+        shell.appendChild(overviewNodes[0]);
+      }
+      if (state.quotaData) {
+        shell.appendChild(renderModelQuotaCard(doc, state.quotaData, state, controller));
+      }
+      for (const node of overviewNodes.slice(1)) {
         shell.appendChild(node);
       }
     } else if (state.statusData) {
@@ -2384,6 +2648,9 @@ export async function mountDashboard(
       );
       shell.appendChild(renderGaugeCard(doc, state.statusData));
       shell.appendChild(renderMetricGrid(doc, state.statusData));
+      if (state.quotaData) {
+        shell.appendChild(renderModelQuotaCard(doc, state.quotaData, state, controller));
+      }
       shell.appendChild(renderSparklineCard(doc, state.statusData));
       shell.appendChild(renderBloatCard(doc, state.statusData));
       shell.appendChild(

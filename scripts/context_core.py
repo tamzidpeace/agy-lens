@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,9 @@ DEFAULT_MODE = "stop"
 DEFAULT_AUTO_REFRESH_SECONDS = 5
 MIN_AUTO_REFRESH_SECONDS = 1
 MAX_AUTO_REFRESH_SECONDS = 300
+DEFAULT_QUOTA_TTL_SECONDS = 120
+AGY_USAGE_TIMEOUT_SECONDS = 45
+AGY_USAGE_MAX_BYTES = 1_048_576
 VALID_MODES = ("warn", "stop", "gate")
 DEFAULT_MODEL_WINDOWS: dict[str, int] = {
     "gemini-4": 1_048_576,
@@ -1596,3 +1602,321 @@ def update_settings(
 
     save_config(config)
     return config
+
+
+def get_quota_cache_path() -> Path:
+    """Return quota cache path, honoring CONTEXT_GUARD_QUOTA_PATH or alongside config."""
+    override = os.environ.get("CONTEXT_GUARD_QUOTA_PATH", "").strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    return get_config_path().parent / "context-guard-quota.json"
+
+
+def _save_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Persist a JSON object atomically with 0600 permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def find_agy_binary() -> str | None:
+    """Locate the Antigravity CLI executable across override, PATH, and standard macOS locations."""
+    if "ANTIGRAVITY_CLI_PATH" in os.environ:
+        explicit = os.environ.get("ANTIGRAVITY_CLI_PATH", "").strip()
+        if not explicit:
+            return None
+        expanded = Path(os.path.expanduser(explicit))
+        return str(expanded) if expanded.is_file() and os.access(expanded, os.X_OK) else None
+
+    which_hit = shutil.which("agy")
+    if which_hit:
+        return which_hit
+
+    candidates = (
+        Path.home() / ".local" / "bin" / "agy",
+        Path.home() / "bin" / "agy",
+        Path("/opt/homebrew/bin/agy"),
+        Path("/usr/local/bin/agy"),
+    )
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _normalize_bucket_label(window: str, raw_name: str) -> str:
+    """Map raw Antigravity quota window/name to a concise dashboard label."""
+    win = window.strip().lower()
+    if win == "5h":
+        return "5h limit"
+    if win == "weekly":
+        return "Weekly limit"
+    cleaned = raw_name.strip()
+    if cleaned.lower().endswith(" remaining"):
+        return cleaned[: -len(" remaining")].strip()
+    return cleaned or window or "Quota"
+
+
+def _format_models_summary(description: str) -> str:
+    """Extract clean model list from Antigravity quota group description."""
+    text = description.strip()
+    prefix = "Models within this group:"
+    if text.lower().startswith(prefix.lower()):
+        return text[len(prefix) :].strip()
+    return text
+
+
+def _normalize_quota_groups(raw_groups: Any) -> list[dict[str, Any]]:
+    """Sanitize quota groups and buckets from cached or live usage data."""
+    if not isinstance(raw_groups, list):
+        return []
+    groups: list[dict[str, Any]] = []
+    for grp in raw_groups:
+        if not isinstance(grp, dict):
+            continue
+        name = str(grp.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(grp.get("description") or "").strip()
+        models_summary = str(grp.get("modelsSummary") or _format_models_summary(description)).strip()
+        raw_buckets = grp.get("buckets")
+        if not isinstance(raw_buckets, list):
+            continue
+
+        buckets: list[dict[str, Any]] = []
+        for bucket in raw_buckets:
+            if not isinstance(bucket, dict):
+                continue
+            raw_fraction = bucket.get("remaining_fraction")
+            if raw_fraction is None:
+                raw_fraction = bucket.get("remainingFraction")
+            if isinstance(raw_fraction, bool) or not isinstance(raw_fraction, (int, float)):
+                pct = bucket.get("remainingPercent")
+                if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+                    continue
+                fraction = max(0.0, min(1.0, float(pct) / 100.0))
+            else:
+                fraction = max(0.0, min(1.0, float(raw_fraction)))
+
+            window = str(bucket.get("window") or "").strip()
+            raw_name = str(bucket.get("name") or bucket.get("label") or "").strip()
+            label = _normalize_bucket_label(window, raw_name)
+            reset_time = str(bucket.get("reset_time") or bucket.get("resetTime") or "").strip()
+            bucket_id = str(bucket.get("id") or f"{name}:{window or label}").strip()
+            remaining_pct = round(fraction * 100.0, 1)
+            buckets.append(
+                {
+                    "id": bucket_id,
+                    "window": window,
+                    "label": label,
+                    "remainingFraction": fraction,
+                    "remainingPercent": remaining_pct,
+                    "resetTime": reset_time,
+                }
+            )
+
+        # Show shorter rolling windows (5h) before weekly limits for fast scanning.
+        buckets.sort(key=lambda b: (0 if b["window"] == "5h" else 1 if b["window"] == "weekly" else 2, b["id"]))
+        if buckets:
+            groups.append(
+                {
+                    "name": name,
+                    "modelsSummary": models_summary,
+                    "buckets": buckets,
+                }
+            )
+    return groups
+
+
+def parse_agy_usage_json(raw_text: str, *, fetched_at: int | None = None) -> dict[str, Any]:
+    """Parse JSON output from `agy -p /usage --output-format json` into quota payload."""
+    try:
+        payload = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid JSON from agy usage command: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected non-object output from agy usage command")
+
+    cmd = payload.get("command")
+    data = cmd.get("data") if isinstance(cmd, dict) else None
+    if not isinstance(data, dict):
+        status_text = str(payload.get("status") or "").strip()
+        raise ValueError(f"Missing command.data in agy usage output (status={status_text or 'unknown'})")
+
+    groups = _normalize_quota_groups(data.get("groups"))
+    if not groups:
+        raise ValueError("No active quota buckets returned by agy usage command")
+
+    ts = int(time.time()) if fetched_at is None else int(fetched_at)
+    return {
+        "available": True,
+        "status": "ok",
+        "source": "agy-cli",
+        "fetchedAt": ts,
+        "stale": False,
+        "fetching": False,
+        "ageSeconds": 0,
+        "description": str(data.get("description") or "").strip(),
+        "groups": groups,
+        "error": "",
+    }
+
+
+def load_quota_cache(
+    *,
+    ttl_seconds: int = DEFAULT_QUOTA_TTL_SECONDS,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Load cached model quota snapshot and compute staleness."""
+    current_ts = int(time.time()) if now_ts is None else int(now_ts)
+    path = get_quota_cache_path()
+    default_payload: dict[str, Any] = {
+        "available": False,
+        "status": "idle",
+        "source": "agy-cli",
+        "fetchedAt": 0,
+        "stale": True,
+        "fetching": False,
+        "ageSeconds": None,
+        "description": "",
+        "groups": [],
+        "error": "",
+    }
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return default_payload
+
+    if not isinstance(raw, dict):
+        return default_payload
+
+    groups = _normalize_quota_groups(raw.get("groups"))
+    fetched_at = max(0, _safe_int(raw.get("fetchedAt"), 0))
+    age_seconds = max(0, current_ts - fetched_at) if fetched_at > 0 else None
+    stale = (age_seconds is None) or (age_seconds >= max(1, ttl_seconds))
+    raw_status = str(raw.get("status") or ("ok" if groups else "idle")).strip()
+    if raw_status not in ("ok", "unavailable", "error", "idle"):
+        raw_status = "ok" if groups else "idle"
+
+    return {
+        "available": bool(groups) and raw.get("available", True) is not False,
+        "status": raw_status,
+        "source": str(raw.get("source") or "agy-cli"),
+        "fetchedAt": fetched_at,
+        "stale": stale,
+        "fetching": False,
+        "ageSeconds": age_seconds,
+        "description": str(raw.get("description") or "").strip(),
+        "groups": groups,
+        "error": str(raw.get("error") or "").strip(),
+    }
+
+
+def fetch_model_quota(
+    *,
+    timeout_seconds: int = AGY_USAGE_TIMEOUT_SECONDS,
+    ttl_seconds: int = DEFAULT_QUOTA_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Fetch live model quota via `agy -p /usage --output-format json` and cache cleanly."""
+    now_ts = int(time.time())
+    prior = load_quota_cache(ttl_seconds=ttl_seconds, now_ts=now_ts)
+    agy_bin = find_agy_binary()
+    if not agy_bin:
+        result = {
+            **prior,
+            "status": "unavailable",
+            "stale": True,
+            "fetching": False,
+            "error": "agy CLI executable not found (install Antigravity CLI to track model quota).",
+        }
+        try:
+            _save_json_atomic(get_quota_cache_path(), result)
+        except OSError:
+            pass
+        return result
+
+    env = dict(os.environ)
+    env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="cg-agy-usage-") as tmp_dir:
+            proc = subprocess.run(
+                [agy_bin, "-p", "/usage", "--output-format", "json"],
+                cwd=tmp_dir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=max(5, timeout_seconds),
+                check=False,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        err_msg = f"Failed to run agy usage check: {exc}"
+        result = {
+            **prior,
+            "status": "error",
+            "fetching": False,
+            "error": err_msg,
+        }
+        try:
+            _save_json_atomic(get_quota_cache_path(), result)
+        except OSError:
+            pass
+        return result
+
+    raw_stdout = (proc.stdout or "")[:AGY_USAGE_MAX_BYTES].strip()
+    if proc.returncode != 0 or not raw_stdout:
+        stderr_hint = _sanitize_snippet(proc.stderr or "", 120)
+        err_msg = (
+            f"agy usage exited {proc.returncode}: {stderr_hint}"
+            if stderr_hint
+            else f"agy usage exited {proc.returncode} (ensure agy CLI is signed in)"
+        )
+        result = {
+            **prior,
+            "status": "error",
+            "fetching": False,
+            "error": err_msg,
+        }
+        try:
+            _save_json_atomic(get_quota_cache_path(), result)
+        except OSError:
+            pass
+        return result
+
+    try:
+        parsed = parse_agy_usage_json(raw_stdout, fetched_at=now_ts)
+    except ValueError as exc:
+        result = {
+            **prior,
+            "status": "error",
+            "fetching": False,
+            "error": str(exc),
+        }
+        try:
+            _save_json_atomic(get_quota_cache_path(), result)
+        except OSError:
+            pass
+        return result
+
+    try:
+        _save_json_atomic(get_quota_cache_path(), parsed)
+    except OSError:
+        pass
+    return parsed
