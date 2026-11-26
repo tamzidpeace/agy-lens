@@ -92,14 +92,39 @@ agy-lens/
 
 ## Installation
 
-```bash
-# If upgrading from v1.x (agy-context-guard):
-agy plugin uninstall agy-context-guard
+### Prerequisites
+- **Antigravity CLI (`agy`)** / Antigravity Desktop or IDE
+- **Python 3.9+** (standard library only — no `pip install` or `npm install` required)
 
-# Install local checkout:
-agy plugin install .
-agy plugin validate --strict --json .
+### Install Directly from GitHub (Recommended)
+
+```bash
+agy plugin install https://github.com/tamzidpeace/agy-context-guard
 ```
+
+### Install from a Local Checkout
+
+```bash
+git clone https://github.com/tamzidpeace/agy-context-guard.git
+cd agy-context-guard
+agy plugin validate --strict --json .
+agy plugin install .
+```
+
+### Upgrading from `v1.x` (`agy-context-guard`)
+
+```bash
+agy plugin uninstall agy-context-guard
+agy plugin install https://github.com/tamzidpeace/agy-context-guard
+```
+
+### Verify & Manage
+
+```bash
+agy plugin list
+```
+
+You can also manage, enable, or disable **Agy Lens** from the Antigravity UI under **Customizations → Plugins**, or invoke the bundled skill directly with `/lens`.
 
 ## Configuration (`~/.gemini/config/agy-lens.json`)
 
