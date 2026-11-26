@@ -12,7 +12,148 @@ import {
 export type GuardStatus = "ok" | "warn" | "limit" | "disabled" | "no_data";
 export type GuardMode = "warn" | "stop" | "gate";
 export type BloatCategoryKey = "user" | "model" | "toolOutputs" | "system";
-export type ViewMode = "status" | "overview";
+export type ViewMode = "status" | "search" | "footprint" | "overview";
+export type SearchScope = "all" | "messages" | "artifacts" | "files";
+
+export interface QuotaPrediction {
+  state: "warming" | "idle" | "active";
+  burnRatePerHour: number | null;
+  hoursUntilExhausted: number | null;
+  hoursUntilReset: number | null;
+  bufferHours: number | null;
+  riskLevel: "unknown" | "safe" | "tight" | "at_risk";
+  sampleCount: number;
+  windowObservedSeconds: number;
+  usedDeltaPct: number;
+}
+
+export interface ActiveLoopState {
+  signature: string;
+  toolName: string;
+  count: number;
+  reason: string;
+  lastErrorSnippet?: string;
+}
+
+export interface LoopGuardConfig {
+  enabled: boolean;
+  consecutiveThreshold: number;
+  nudgeOncePerStreak?: boolean;
+  autoPauseThreshold: number;
+}
+
+export interface AlertsConfig {
+  soundEnabled: boolean;
+  desktopNotificationEnabled: boolean;
+  notifyOnStop: boolean;
+  notifyOnThreshold: boolean;
+  notifyOnLoop: boolean;
+  notifyOnLowQuotaPct: number;
+  cooldownSeconds?: number;
+}
+
+export interface SearchSnippet {
+  source: string;
+  label: string;
+  text: string;
+  spans: Array<[number, number]>;
+}
+
+export interface SearchResultItem {
+  convId: string;
+  title: string;
+  updatedAt: string;
+  sourceApp?: string;
+  isSubagent?: boolean;
+  matchCount: number;
+  editedFiles: string[];
+  snippets: SearchSnippet[];
+}
+
+export interface SearchPayload {
+  view: "search";
+  query: string;
+  scope: SearchScope;
+  includeSubagents: boolean;
+  totalIndexed: number;
+  matchedCount: number;
+  results: SearchResultItem[];
+}
+
+export interface FootprintWarning {
+  code: string;
+  severity: "warning" | "info";
+  title: string;
+  detail: string;
+  path?: string;
+}
+
+export interface FootprintRuleItem {
+  name: string;
+  scope: string;
+  path: string;
+  bytes: number;
+  estTokens: number;
+}
+
+export interface FootprintSkillItem {
+  name: string;
+  description: string;
+  scope: string;
+  source: string;
+  path: string;
+  frontmatterTokens: number;
+  bodyTokens: number;
+  enabled: boolean;
+}
+
+export interface FootprintMcpItem {
+  name: string;
+  scope: string;
+  source: string;
+  enabled: boolean;
+  commandPreview: string;
+  envKeys: string[];
+  envKeyCount: number;
+  estTokens: number;
+  path: string;
+}
+
+export interface FootprintHookItem {
+  name: string;
+  scope: string;
+  enabled: boolean;
+  events: string[];
+  timeoutSeconds: number;
+  path: string;
+}
+
+export interface FootprintPayload {
+  view: "footprint";
+  workspacePath: string;
+  summary: {
+    estimatedStartupTokens: number;
+    onDemandSkillsTokens: number;
+    observedStartupTokens: number | null;
+    rulesCount: number;
+    pluginsCount: number;
+    skillsCount: number;
+    builtinSkillsCount: number;
+    mcpServersCount: number;
+    hooksCount: number;
+  };
+  builtinSkillsSummary?: {
+    count: number;
+    frontmatterTokens: number;
+    onDemandTokens: number;
+  };
+  warnings: FootprintWarning[];
+  rules: FootprintRuleItem[];
+  plugins: Array<{ id: string; name: string; version: string; enabled: boolean; scope: string; path: string }>;
+  skills: FootprintSkillItem[];
+  mcpServers: FootprintMcpItem[];
+  hooks: FootprintHookItem[];
+}
 
 export interface HistoryPoint {
   stepIndex: number;
@@ -49,6 +190,7 @@ export interface QuotaBucket {
   remainingFraction: number;
   remainingPercent: number;
   resetTime: string;
+  prediction?: QuotaPrediction;
 }
 
 export interface QuotaGroup {
@@ -105,6 +247,9 @@ export interface StatusPayload {
   bloatByCategory: BloatByCategory;
   topBloatSteps: BloatStep[];
   modelQuota?: ModelQuotaPayload;
+  activeLoop?: ActiveLoopState | null;
+  loopGuard?: LoopGuardConfig;
+  alerts?: AlertsConfig;
 }
 
 export interface OverviewConversation {
@@ -198,6 +343,12 @@ export interface DashboardController {
   dispose: () => void;
   refreshCurrentView: (skipIfBusy?: boolean) => Promise<void>;
   switchToOverview: () => Promise<void>;
+  switchToSearch: () => Promise<void>;
+  switchToFootprint: (workspacePath?: string) => Promise<void>;
+  runSearch: (query?: string, scope?: SearchScope, includeSubagents?: boolean) => Promise<void>;
+  refreshFootprint: (workspacePath?: string) => Promise<void>;
+  clearActiveLoop: () => Promise<void>;
+  triggerTestAlert: () => Promise<void>;
   selectConversation: (conversationId: string) => Promise<void>;
   triggerSnooze: (deltaTokens: number) => Promise<void>;
   triggerResetSnooze: () => Promise<void>;
@@ -215,6 +366,8 @@ interface SettingsDraft {
   warnPercent: number;
   mode: GuardMode;
   autoRefreshSeconds?: number;
+  loopGuard?: LoopGuardConfig;
+  alerts?: AlertsConfig;
 }
 
 interface BannerState {
@@ -234,6 +387,12 @@ interface DashboardState {
   overviewLimit: number;
   statusData: StatusPayload | null;
   overviewData: OverviewPayload | null;
+  searchData: SearchPayload | null;
+  footprintData: FootprintPayload | null;
+  searchQuery: string;
+  searchScope: SearchScope;
+  searchIncludeSubagents: boolean;
+  footprintWorkspaceInput: string;
   quotaData: ModelQuotaPayload | null;
   handoffData: HandoffPayload | null;
   handoffSentToNewChat: boolean;
@@ -256,6 +415,23 @@ const AUTO_REFRESH_PRESETS = [2, 5, 10, 30, 60] as const;
 const SNOOZE_STEP_TOKENS = 50_000;
 const MIN_THRESHOLD_TOKENS = 1_000;
 const THRESHOLD_PRESETS = [150_000, 200_000, 300_000, 500_000] as const;
+
+const DEFAULT_LOOP_GUARD_DRAFT: LoopGuardConfig = {
+  enabled: true,
+  consecutiveThreshold: 3,
+  nudgeOncePerStreak: true,
+  autoPauseThreshold: 5,
+};
+
+const DEFAULT_ALERTS_DRAFT: AlertsConfig = {
+  soundEnabled: true,
+  desktopNotificationEnabled: true,
+  notifyOnStop: true,
+  notifyOnThreshold: true,
+  notifyOnLoop: true,
+  notifyOnLowQuotaPct: 15,
+  cooldownSeconds: 15,
+};
 
 const MODE_DESCRIPTIONS: Record<GuardMode, string> = {
   warn: "Warn once per compaction epoch without interrupting turns.",
@@ -325,6 +501,79 @@ export function isOverviewPayload(value: unknown): value is OverviewPayload {
 /** Validate a HandoffPayload structuredContent object from mcp_server.py. */
 export function isHandoffPayload(value: unknown): value is HandoffPayload {
   return isRecord(value) && typeof value.brief === "string";
+}
+
+/** Validate a SearchPayload structuredContent object from mcp_server.py. */
+export function isSearchPayload(value: unknown): value is SearchPayload {
+  return (
+    isRecord(value) &&
+    value.view === "search" &&
+    Array.isArray(value.results)
+  );
+}
+
+/** Validate a FootprintPayload structuredContent object from mcp_server.py. */
+export function isFootprintPayload(value: unknown): value is FootprintPayload {
+  return (
+    isRecord(value) &&
+    value.view === "footprint" &&
+    isRecord(value.summary)
+  );
+}
+
+export function formatDurationHours(hours: number | null | undefined): string {
+  if (typeof hours !== "number" || !Number.isFinite(hours) || hours < 0) {
+    return "";
+  }
+  const mins = Math.round(hours * 60);
+  if (mins < 60) return `${Math.max(1, mins)}m`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+export function formatQuotaPrediction(pred: QuotaPrediction | undefined): {
+  text: string;
+  toneClass: string;
+} | null {
+  if (!pred) return null;
+  if (pred.state === "warming") {
+    return { text: "Collecting burn-rate baseline...", toneClass: "cg-quota-pred" };
+  }
+  if (pred.state === "idle") {
+    return { text: "Idle burn (0%/hr) · Safe", toneClass: "cg-quota-pred cg-quota-pred-safe" };
+  }
+  const rate = pred.burnRatePerHour;
+  if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+    return null;
+  }
+  const rateStr = `${Number.isInteger(rate) ? rate : rate.toFixed(1)}%/hr`;
+  if (pred.riskLevel === "at_risk" && pred.hoursUntilExhausted !== null) {
+    return {
+      text: `Burn ~${rateStr} · Runs out ~${formatDurationHours(pred.hoursUntilExhausted)} before reset`,
+      toneClass: "cg-quota-pred cg-quota-pred-risk",
+    };
+  }
+  if (pred.riskLevel === "tight" && pred.bufferHours !== null) {
+    return {
+      text: `Burn ~${rateStr} · Tight (~${formatDurationHours(Math.max(0, pred.bufferHours))} buffer)`,
+      toneClass: "cg-quota-pred cg-quota-pred-tight",
+    };
+  }
+  if (pred.riskLevel === "safe") {
+    const buf =
+      pred.bufferHours !== null && pred.bufferHours > 0
+        ? ` (~${formatDurationHours(pred.bufferHours)} buffer)`
+        : "";
+    return {
+      text: `Burn ~${rateStr} · Safe until reset${buf}`,
+      toneClass: "cg-quota-pred cg-quota-pred-safe",
+    };
+  }
+  return {
+    text: `Burn ~${rateStr}${pred.hoursUntilExhausted !== null ? ` · Est. ~${formatDurationHours(pred.hoursUntilExhausted)} left` : ""}`,
+    toneClass: "cg-quota-pred",
+  };
 }
 
 /** Format ISO reset timestamp into a concise "Resets in ..." string when active. */
@@ -716,12 +965,14 @@ function renderHeader(
   state: DashboardState,
   controller: DashboardController,
   onToggleAuto: () => void,
+  onToggleSettings: () => void,
 ): HTMLElement {
+  const wrapper = el(doc, "div");
   const header = el(doc, "header", "cg-header");
 
   const brand = el(doc, "div", "cg-brand");
   brand.appendChild(createBrandIcon(doc));
-  brand.appendChild(el(doc, "span", "cg-title", "Context Guard"));
+  brand.appendChild(el(doc, "span", "cg-title", "Agy Lens"));
 
   if (state.currentView === "status" && state.statusData) {
     brand.appendChild(
@@ -752,45 +1003,12 @@ function renderHeader(
   const controls = el(doc, "div", "cg-header-controls");
   const canServerTools = Boolean(state.hostCapabilities?.serverTools);
 
-  if (state.currentView === "status") {
-    controls.appendChild(
-      createButton(doc, "Overview", {
-        className: "cg-btn cg-btn-sm",
-        disabled: !canServerTools,
-        title: canServerTools
-          ? "View all recent conversations"
-          : "Host does not support server tool calls",
-        onClick: () => {
-          void controller.switchToOverview();
-        },
-      }),
-    );
-  } else if (state.statusData || state.overviewData?.active) {
-    controls.appendChild(
-      createButton(doc, "Detail", {
-        className: "cg-btn cg-btn-sm",
-        disabled: !canServerTools && !state.statusData,
-        onClick: () => {
-          const targetId =
-            state.activeConversationId ||
-            state.overviewData?.active?.conversationId ||
-            "";
-          if (targetId && canServerTools) {
-            void controller.selectConversation(targetId);
-          } else if (state.statusData) {
-            controller.showStatusView();
-          }
-        },
-      }),
-    );
-  }
-
   controls.appendChild(
     createButton(doc, state.loading ? "Syncing..." : "Refresh", {
       className: "cg-btn cg-btn-sm",
       disabled: !canServerTools || state.loading,
       title: canServerTools
-        ? "Refresh metrics now"
+        ? "Refresh active view now"
         : "Host does not support server tool calls",
       onClick: () => {
         void controller.refreshCurrentView(false);
@@ -814,8 +1032,89 @@ function renderHeader(
   }
   controls.appendChild(autoBtn);
 
+  controls.appendChild(
+    createButton(doc, state.settingsOpen ? "Hide Settings" : "Settings", {
+      className: state.settingsOpen ? "cg-btn cg-btn-sm cg-btn-active" : "cg-btn cg-btn-sm",
+      onClick: onToggleSettings,
+    }),
+  );
+
   header.append(brand, controls);
-  return header;
+  wrapper.appendChild(header);
+
+  const tabs = el(doc, "nav", "cg-tabs");
+  const tabDefs: Array<{ id: ViewMode; label: string; disabled?: boolean; onClick: () => void }> = [
+    {
+      id: "status",
+      label: "Monitor",
+      onClick: () => {
+        const targetId = state.activeConversationId || state.overviewData?.active?.conversationId || "";
+        if (!state.statusData && targetId && canServerTools) {
+          void controller.selectConversation(targetId);
+        } else {
+          controller.showStatusView();
+        }
+      },
+    },
+    {
+      id: "search",
+      label: "Search",
+      disabled: !canServerTools,
+      onClick: () => {
+        void controller.switchToSearch();
+      },
+    },
+    {
+      id: "footprint",
+      label: "Setup",
+      disabled: !canServerTools,
+      onClick: () => {
+        void controller.switchToFootprint();
+      },
+    },
+    {
+      id: "overview",
+      label: "Chats",
+      disabled: !canServerTools,
+      onClick: () => {
+        void controller.switchToOverview();
+      },
+    },
+  ];
+  for (const tab of tabDefs) {
+    tabs.appendChild(
+      createButton(doc, tab.label, {
+        className: state.currentView === tab.id ? "cg-tab cg-tab-active" : "cg-tab",
+        disabled: Boolean(tab.disabled),
+        onClick: tab.onClick,
+      }),
+    );
+  }
+  wrapper.appendChild(tabs);
+  return wrapper;
+}
+
+function renderLoopBanner(
+  doc: Document,
+  activeLoop: ActiveLoopState | null | undefined,
+  loading: boolean,
+  onDismiss: () => void,
+): HTMLElement | null {
+  if (!activeLoop) return null;
+  const card = el(doc, "div", "cg-loop-banner");
+  const reasonLabel =
+    activeLoop.reason === "identical_repeats" ? "identical repeats" : "consecutive failures";
+  const detail = activeLoop.lastErrorSnippet ? ` — ${activeLoop.lastErrorSnippet}` : "";
+  const msg = `Loop Guard: ${activeLoop.toolName} (${activeLoop.count}x ${reasonLabel})${detail}`;
+  card.appendChild(el(doc, "span", undefined, msg));
+  card.appendChild(
+    createButton(doc, "Dismiss Loop", {
+      className: "cg-btn cg-btn-sm",
+      disabled: loading,
+      onClick: onDismiss,
+    }),
+  );
+  return card;
 }
 
 function renderBanner(
@@ -1172,6 +1471,10 @@ function renderModelQuotaCard(
       if (resetText) {
         left.appendChild(el(doc, "span", "cg-quota-reset", resetText));
       }
+      const pred = formatQuotaPrediction(bucket.prediction);
+      if (pred) {
+        left.appendChild(el(doc, "span", pred.toneClass, pred.text));
+      }
 
       const right = el(doc, "div", "cg-quota-right cg-nums");
       right.appendChild(
@@ -1194,20 +1497,31 @@ function renderModelQuotaCard(
 
 function renderSparklineCard(doc: Document, status: StatusPayload): HTMLElement {
   const card = el(doc, "section", "cg-card");
+  const activeEpochStep =
+    typeof status.activeEpochStep === "number" && Number.isFinite(status.activeEpochStep)
+      ? status.activeEpochStep
+      : 0;
+  const epochHistory =
+    activeEpochStep > 0
+      ? status.history.filter((item) => item.stepIndex >= activeEpochStep)
+      : status.history;
+
   const head = el(doc, "div", "cg-card-head");
   head.appendChild(el(doc, "span", "cg-card-title", "Turn-by-Turn Growth"));
 
+  const epochPrefix =
+    status.compactionCount > 0 && activeEpochStep > 0 ? `Since #${activeEpochStep} · ` : "";
   const meta = el(
     doc,
     "span",
     "cg-muted cg-nums",
-    `${status.history.length} turns · avg +${formatTokens(status.avgDeltaPerTurn)}/turn`,
+    `${epochPrefix}${epochHistory.length} turns · avg +${formatTokens(status.avgDeltaPerTurn)}/turn`,
   );
   head.appendChild(meta);
   card.appendChild(head);
 
   const model = buildSparklineModel(
-    status.history,
+    epochHistory,
     status.effectiveThresholdTokens,
     320,
     96,
@@ -1215,9 +1529,11 @@ function renderSparklineCard(doc: Document, status: StatusPayload): HTMLElement 
   );
 
   if (model.points.length === 0) {
-    card.appendChild(
-      el(doc, "div", "cg-muted", "Waiting for completed PLANNER_RESPONSE turns..."),
-    );
+    const emptyMsg =
+      status.compactionCount > 0 && activeEpochStep > 0
+        ? `Compacted at step #${activeEpochStep} · Waiting for next PLANNER_RESPONSE turn...`
+        : "Waiting for completed PLANNER_RESPONSE turns...";
+    card.appendChild(el(doc, "div", "cg-muted", emptyMsg));
     return card;
   }
 
@@ -1409,7 +1725,6 @@ function renderActionBar(
   status: StatusPayload,
   state: DashboardState,
   controller: DashboardController,
-  onToggleSettings: () => void,
 ): HTMLElement {
   const card = el(doc, "section", "cg-card");
   const bar = el(doc, "div", "cg-actions");
@@ -1474,13 +1789,6 @@ function renderActionBar(
       }),
     );
   }
-
-  bar.appendChild(
-    createButton(doc, state.settingsOpen ? "Hide Settings" : "Settings", {
-      className: state.settingsOpen ? "cg-btn cg-btn-active" : "cg-btn",
-      onClick: onToggleSettings,
-    }),
-  );
 
   card.appendChild(bar);
   return card;
@@ -1573,7 +1881,7 @@ function renderSettingsDrawer(
   const card = el(doc, "section", "cg-card");
 
   const head = el(doc, "div", "cg-card-head");
-  head.appendChild(el(doc, "span", "cg-card-title", "Context Guard Settings"));
+  head.appendChild(el(doc, "span", "cg-card-title", "Agy Lens Settings"));
   head.appendChild(
     createButton(doc, "Close", {
       className: "cg-btn cg-btn-sm",
@@ -1706,6 +2014,87 @@ function renderSettingsDrawer(
   refreshField.appendChild(refreshInputRow);
   card.appendChild(refreshField);
 
+  const lgDraft = draft.loopGuard ?? { ...DEFAULT_LOOP_GUARD_DRAFT };
+  draft.loopGuard = lgDraft;
+  const lgSection = el(doc, "div", "cg-field");
+  lgSection.appendChild(el(doc, "span", "cg-label", "Loop Guard (Stuck-Loop Detector)"));
+  const lgEnabledRow = el(doc, "label", "cg-field-row");
+  lgEnabledRow.appendChild(el(doc, "span", "cg-muted", "Enable Loop Guard"));
+  const lgCb = el(doc, "input");
+  lgCb.type = "checkbox";
+  lgCb.checked = lgDraft.enabled;
+  lgCb.addEventListener("change", () => {
+    lgDraft.enabled = lgCb.checked;
+  });
+  lgEnabledRow.appendChild(lgCb);
+  lgSection.appendChild(lgEnabledRow);
+
+  const lgGrid = el(doc, "div", "cg-form-grid");
+  const lgThreshWrap = el(doc, "div", "cg-field");
+  lgThreshWrap.appendChild(el(doc, "label", "cg-muted", "Failure/Repeat Nudge (2-6)"));
+  const lgThreshIn = el(doc, "input", "cg-input cg-nums");
+  lgThreshIn.type = "number";
+  lgThreshIn.min = "2";
+  lgThreshIn.max = "6";
+  lgThreshIn.value = String(lgDraft.consecutiveThreshold);
+  lgThreshIn.addEventListener("input", () => {
+    const p = Number.parseInt(lgThreshIn.value, 10);
+    if (Number.isFinite(p)) lgDraft.consecutiveThreshold = p;
+  });
+  lgThreshWrap.appendChild(lgThreshIn);
+
+  const lgPauseWrap = el(doc, "div", "cg-field");
+  lgPauseWrap.appendChild(el(doc, "label", "cg-muted", "Auto-Pause Threshold (0=off, 4-10)"));
+  const lgPauseIn = el(doc, "input", "cg-input cg-nums");
+  lgPauseIn.type = "number";
+  lgPauseIn.min = "0";
+  lgPauseIn.max = "10";
+  lgPauseIn.value = String(lgDraft.autoPauseThreshold);
+  lgPauseIn.addEventListener("input", () => {
+    const p = Number.parseInt(lgPauseIn.value, 10);
+    if (Number.isFinite(p)) lgDraft.autoPauseThreshold = p;
+  });
+  lgPauseWrap.appendChild(lgPauseIn);
+  lgGrid.append(lgThreshWrap, lgPauseWrap);
+  lgSection.appendChild(lgGrid);
+  card.appendChild(lgSection);
+
+  const alertsDraft = draft.alerts ?? { ...DEFAULT_ALERTS_DRAFT };
+  draft.alerts = alertsDraft;
+  const alertsSection = el(doc, "div", "cg-field");
+  alertsSection.appendChild(el(doc, "span", "cg-label", "Smart Alerts (Sound & Notifications)"));
+  const alertToggleDefs: Array<{ label: string; get: () => boolean; set: (v: boolean) => void }> = [
+    { label: "Sound Alerts", get: () => alertsDraft.soundEnabled, set: (v) => { alertsDraft.soundEnabled = v; } },
+    { label: "Desktop Notifications", get: () => alertsDraft.desktopNotificationEnabled, set: (v) => { alertsDraft.desktopNotificationEnabled = v; } },
+    { label: "Notify on Task Done (Stop)", get: () => alertsDraft.notifyOnStop, set: (v) => { alertsDraft.notifyOnStop = v; } },
+    { label: "Notify on Context Limit", get: () => alertsDraft.notifyOnThreshold, set: (v) => { alertsDraft.notifyOnThreshold = v; } },
+    { label: "Notify on Loop Detected", get: () => alertsDraft.notifyOnLoop, set: (v) => { alertsDraft.notifyOnLoop = v; } },
+  ];
+  for (const item of alertToggleDefs) {
+    const row = el(doc, "label", "cg-field-row");
+    row.appendChild(el(doc, "span", "cg-muted", item.label));
+    const cb = el(doc, "input");
+    cb.type = "checkbox";
+    cb.checked = item.get();
+    cb.addEventListener("change", () => item.set(cb.checked));
+    row.appendChild(cb);
+    alertsSection.appendChild(row);
+  }
+  const lowQuotaRow = el(doc, "div", "cg-field-row");
+  lowQuotaRow.appendChild(el(doc, "label", "cg-muted", "Low 5h Quota Alert % (0=off)"));
+  const lowQuotaIn = el(doc, "input", "cg-input cg-nums");
+  lowQuotaIn.type = "number";
+  lowQuotaIn.min = "0";
+  lowQuotaIn.max = "50";
+  lowQuotaIn.value = String(alertsDraft.notifyOnLowQuotaPct);
+  lowQuotaIn.addEventListener("input", () => {
+    const p = Number.parseInt(lowQuotaIn.value, 10);
+    if (Number.isFinite(p)) alertsDraft.notifyOnLowQuotaPct = p;
+  });
+  lowQuotaRow.appendChild(lowQuotaIn);
+  alertsSection.appendChild(lowQuotaRow);
+  card.appendChild(alertsSection);
+
   const footer = el(doc, "div", "cg-actions");
   const canServerTools = Boolean(state.hostCapabilities?.serverTools);
   footer.appendChild(
@@ -1714,6 +2103,15 @@ function renderSettingsDrawer(
       disabled: !canServerTools || state.loading,
       onClick: () => {
         void controller.saveSettings({ ...draft });
+      },
+    }),
+  );
+  footer.appendChild(
+    createButton(doc, "Test Sound & Alert", {
+      className: "cg-btn",
+      disabled: !canServerTools || state.loading,
+      onClick: () => {
+        void controller.triggerTestAlert();
       },
     }),
   );
@@ -1731,7 +2129,6 @@ function renderOverviewView(
   overview: OverviewPayload,
   state: DashboardState,
   controller: DashboardController,
-  onToggleSettings: () => void,
   onToggleSubagents: () => void,
 ): HTMLElement[] {
   const nodes: HTMLElement[] = [];
@@ -1764,12 +2161,6 @@ function renderOverviewView(
       ),
     );
   }
-  headActions.appendChild(
-    createButton(doc, state.settingsOpen ? "Hide Settings" : "Settings", {
-      className: state.settingsOpen ? "cg-btn cg-btn-sm cg-btn-active" : "cg-btn cg-btn-sm",
-      onClick: onToggleSettings,
-    }),
-  );
   head.appendChild(headActions);
   summaryCard.appendChild(head);
 
@@ -1868,6 +2259,333 @@ function renderOverviewView(
   return nodes;
 }
 
+function renderHighlightedText(
+  doc: Document,
+  text: string,
+  spans: Array<[number, number]>,
+): HTMLElement {
+  const container = el(doc, "div", "cg-snippet");
+  const sorted = [...spans]
+    .filter(([s, e]) => Number.isFinite(s) && Number.isFinite(e) && s >= 0 && e > s && e <= text.length)
+    .sort((a, b) => a[0] - b[0]);
+  let cursor = 0;
+  for (const [start, end] of sorted) {
+    if (start > cursor) {
+      container.appendChild(doc.createTextNode(text.slice(cursor, start)));
+    }
+    if (end > start && start >= cursor) {
+      container.appendChild(el(doc, "mark", "cg-mark", text.slice(start, end)));
+      cursor = end;
+    }
+  }
+  if (cursor < text.length) {
+    container.appendChild(doc.createTextNode(text.slice(cursor)));
+  }
+  return container;
+}
+
+function renderSearchView(
+  doc: Document,
+  state: DashboardState,
+  controller: DashboardController,
+  onSearchInput: (query: string) => void,
+  onCopyResult: (item: SearchResultItem) => void,
+): HTMLElement[] {
+  const nodes: HTMLElement[] = [];
+  const controlsCard = el(doc, "section", "cg-card");
+  const head = el(doc, "div", "cg-card-head");
+  head.appendChild(el(doc, "span", "cg-card-title", "Cross-Chat Search"));
+  if (state.searchData) {
+    head.appendChild(
+      el(
+        doc,
+        "span",
+        "cg-muted cg-nums",
+        `${state.searchData.matchedCount} match(es) / ${state.searchData.totalIndexed} chats`,
+      ),
+    );
+  }
+  controlsCard.appendChild(head);
+
+  const searchBar = el(doc, "div", "cg-search-bar");
+  const input = el(doc, "input", "cg-input");
+  input.type = "text";
+  input.placeholder = "Search transcripts, errors, artifacts, files...";
+  input.value = state.searchQuery;
+  input.addEventListener("input", () => {
+    onSearchInput(input.value);
+  });
+  input.addEventListener("keydown", (evt) => {
+    if ((evt as KeyboardEvent).key === "Enter") {
+      void controller.runSearch(input.value, state.searchScope, state.searchIncludeSubagents);
+    }
+  });
+  searchBar.appendChild(input);
+  searchBar.appendChild(
+    createButton(doc, "Search", {
+      className: "cg-btn cg-btn-primary cg-btn-sm",
+      disabled: state.loading,
+      onClick: () => {
+        void controller.runSearch(input.value, state.searchScope, state.searchIncludeSubagents);
+      },
+    }),
+  );
+  controlsCard.appendChild(searchBar);
+
+  const filterRow = el(doc, "div", "cg-subcard-row");
+  const scopesWrap = el(doc, "div", "cg-segmented");
+  const scopeDefs: Array<{ id: SearchScope; label: string }> = [
+    { id: "all", label: "All" },
+    { id: "messages", label: "Messages" },
+    { id: "artifacts", label: "Artifacts" },
+    { id: "files", label: "Files" },
+  ];
+  for (const sc of scopeDefs) {
+    scopesWrap.appendChild(
+      createButton(doc, sc.label, {
+        className: state.searchScope === sc.id ? "cg-btn cg-btn-sm cg-btn-active" : "cg-btn cg-btn-sm",
+        onClick: () => {
+          void controller.runSearch(state.searchQuery, sc.id, state.searchIncludeSubagents);
+        },
+      }),
+    );
+  }
+  filterRow.appendChild(scopesWrap);
+
+  const subLabel = el(doc, "label", "cg-field-row");
+  subLabel.appendChild(el(doc, "span", "cg-muted", "Subagents"));
+  const subCb = el(doc, "input");
+  subCb.type = "checkbox";
+  subCb.checked = state.searchIncludeSubagents;
+  subCb.addEventListener("change", () => {
+    void controller.runSearch(state.searchQuery, state.searchScope, subCb.checked);
+  });
+  subLabel.appendChild(subCb);
+  filterRow.appendChild(subLabel);
+  controlsCard.appendChild(filterRow);
+  nodes.push(controlsCard);
+
+  if (!state.searchData) {
+    const empty = el(doc, "section", "cg-card cg-empty");
+    empty.appendChild(el(doc, "div", undefined, "Indexing recent conversations..."));
+    nodes.push(empty);
+    return nodes;
+  }
+
+  if (state.searchData.results.length === 0) {
+    const empty = el(doc, "section", "cg-card cg-empty");
+    empty.appendChild(
+      el(doc, "div", undefined, "No matching chats found. Try fewer terms or toggle Subagents."),
+    );
+    nodes.push(empty);
+    return nodes;
+  }
+
+  for (const item of state.searchData.results) {
+    const card = el(doc, "section", "cg-card");
+    const rHead = el(doc, "div", "cg-card-head");
+    const titleWrap = el(doc, "div");
+    titleWrap.appendChild(el(doc, "div", "cg-card-title", item.title || shortConvId(item.convId)));
+    const metaParts = [shortConvId(item.convId)];
+    if (item.sourceApp) metaParts.push(item.sourceApp);
+    if (item.updatedAt) metaParts.push(item.updatedAt.slice(0, 16).replace("T", " "));
+    titleWrap.appendChild(el(doc, "div", "cg-muted", metaParts.join(" · ")));
+    rHead.appendChild(titleWrap);
+    rHead.appendChild(el(doc, "span", "cg-pill cg-pill-muted cg-nums", `${item.matchCount} hits`));
+    card.appendChild(rHead);
+
+    if (item.editedFiles && item.editedFiles.length > 0) {
+      const chips = el(doc, "div", "cg-chip-row");
+      for (const f of item.editedFiles.slice(0, 4)) {
+        chips.appendChild(el(doc, "span", "cg-chip", f));
+      }
+      card.appendChild(chips);
+    }
+
+    for (const snip of item.snippets || []) {
+      const snipWrap = el(doc, "div");
+      if (snip.label) {
+        snipWrap.appendChild(el(doc, "div", "cg-muted", `${snip.source} · ${snip.label}`));
+      }
+      snipWrap.appendChild(renderHighlightedText(doc, snip.text, snip.spans || []));
+      card.appendChild(snipWrap);
+    }
+
+    const actions = el(doc, "div", "cg-actions");
+    actions.appendChild(
+      createButton(doc, "Open in Monitor", {
+        className: "cg-btn cg-btn-primary cg-btn-sm",
+        onClick: () => {
+          void controller.selectConversation(item.convId);
+        },
+      }),
+    );
+    actions.appendChild(
+      createButton(doc, "Copy Context", {
+        className: "cg-btn cg-btn-sm",
+        onClick: () => {
+          onCopyResult(item);
+        },
+      }),
+    );
+    card.appendChild(actions);
+    nodes.push(card);
+  }
+
+  return nodes;
+}
+
+function renderSetupView(
+  doc: Document,
+  state: DashboardState,
+  controller: DashboardController,
+): HTMLElement[] {
+  const nodes: HTMLElement[] = [];
+  const headerCard = el(doc, "section", "cg-card");
+  const head = el(doc, "div", "cg-card-head");
+  head.appendChild(el(doc, "span", "cg-card-title", "Startup Context & Customizations Footprint"));
+  headerCard.appendChild(head);
+
+  const bar = el(doc, "div", "cg-setup-bar");
+  const wsIn = el(doc, "input", "cg-input");
+  wsIn.type = "text";
+  wsIn.placeholder = "Workspace path (auto-inferred if blank)";
+  wsIn.value = state.footprintWorkspaceInput || state.footprintData?.workspacePath || "";
+  wsIn.addEventListener("input", () => {
+    state.footprintWorkspaceInput = wsIn.value;
+  });
+  bar.appendChild(wsIn);
+  bar.appendChild(
+    createButton(doc, "Rescan", {
+      className: "cg-btn cg-btn-primary cg-btn-sm",
+      disabled: state.loading,
+      onClick: () => {
+        void controller.refreshFootprint(wsIn.value);
+      },
+    }),
+  );
+  headerCard.appendChild(bar);
+  nodes.push(headerCard);
+
+  const fp = state.footprintData;
+  if (!fp) {
+    const empty = el(doc, "section", "cg-card cg-empty");
+    empty.appendChild(el(doc, "div", undefined, "Scanning Antigravity rules, plugins, skills, MCPs, and hooks..."));
+    nodes.push(empty);
+    return nodes;
+  }
+
+  const kpiGrid = el(doc, "div", "cg-metrics-grid");
+  const kpis = [
+    { label: "Est. Startup", value: formatTokens(fp.summary.estimatedStartupTokens), sub: "always-loaded baseline" },
+    {
+      label: "Observed",
+      value: fp.summary.observedStartupTokens !== null ? formatTokens(fp.summary.observedStartupTokens) : "—",
+      sub: "first turn prompt",
+    },
+    { label: "On-Demand Skills", value: formatTokens(fp.summary.onDemandSkillsTokens), sub: `${fp.summary.skillsCount + fp.summary.builtinSkillsCount} total skills` },
+    {
+      label: "Customizations",
+      value: `${fp.summary.rulesCount}R · ${fp.summary.skillsCount}S`,
+      sub: `${fp.summary.mcpServersCount} MCP · ${fp.summary.hooksCount} hooks`,
+    },
+  ];
+  for (const kpi of kpis) {
+    const tile = el(doc, "div", "cg-metric");
+    tile.appendChild(el(doc, "div", "cg-metric-label", kpi.label));
+    tile.appendChild(el(doc, "div", "cg-metric-value cg-nums", kpi.value));
+    tile.appendChild(el(doc, "div", "cg-muted", kpi.sub));
+    kpiGrid.appendChild(tile);
+  }
+  const kpiCard = el(doc, "section", "cg-card");
+  kpiCard.appendChild(kpiGrid);
+  nodes.push(kpiCard);
+
+  if (fp.warnings.length > 0) {
+    const warnSection = el(doc, "section", "cg-card");
+    warnSection.appendChild(el(doc, "div", "cg-card-title", `Diagnostics (${fp.warnings.length})`));
+    for (const w of fp.warnings) {
+      const box = el(doc, "div", w.severity === "info" ? "cg-warn-card cg-warn-card-info" : "cg-warn-card");
+      box.appendChild(el(doc, "strong", undefined, w.title));
+      box.appendChild(el(doc, "div", undefined, w.detail));
+      if (w.path) box.appendChild(el(doc, "div", "cg-path", w.path));
+      warnSection.appendChild(box);
+    }
+    nodes.push(warnSection);
+  }
+
+  const rulesCard = el(doc, "section", "cg-card");
+  rulesCard.appendChild(el(doc, "div", "cg-card-title", `Always-Loaded Rules (${fp.rules.length})`));
+  if (fp.rules.length === 0) {
+    rulesCard.appendChild(el(doc, "div", "cg-muted", "No GEMINI.md / AGENTS.md / rules found."));
+  } else {
+    for (const r of fp.rules) {
+      const row = el(doc, "div", "cg-subcard");
+      const top = el(doc, "div", "cg-subcard-row");
+      top.appendChild(el(doc, "span", "cg-label", `${r.name} (${r.scope})`));
+      top.appendChild(el(doc, "span", "cg-muted cg-nums", `~${formatTokens(r.estTokens)} tok`));
+      row.appendChild(top);
+      row.appendChild(el(doc, "div", "cg-path", r.path));
+      rulesCard.appendChild(row);
+    }
+  }
+  nodes.push(rulesCard);
+
+  const skillsCard = el(doc, "section", "cg-card");
+  skillsCard.appendChild(
+    el(doc, "div", "cg-card-title", `Plugins (${fp.plugins.length}) & Skills (${fp.skills.length} custom)`),
+  );
+  if (fp.builtinSkillsSummary && fp.builtinSkillsSummary.count > 0) {
+    skillsCard.appendChild(
+      el(
+        doc,
+        "div",
+        "cg-muted cg-nums",
+        `Built-in skills: ${fp.builtinSkillsSummary.count} (~${formatTokens(fp.builtinSkillsSummary.frontmatterTokens)} baseline · ~${formatTokens(fp.builtinSkillsSummary.onDemandTokens)} on-demand)`,
+      ),
+    );
+  }
+  for (const s of fp.skills.slice(0, 20)) {
+    const row = el(doc, "div", "cg-subcard");
+    const top = el(doc, "div", "cg-subcard-row");
+    top.appendChild(el(doc, "span", "cg-label", `${s.name} · ${s.source} (${s.scope})`));
+    top.appendChild(
+      el(doc, "span", "cg-muted cg-nums", `${s.frontmatterTokens} base / ${formatTokens(s.bodyTokens)} body`),
+    );
+    row.appendChild(top);
+    row.appendChild(el(doc, "div", "cg-path", s.path));
+    skillsCard.appendChild(row);
+  }
+  nodes.push(skillsCard);
+
+  const infraCard = el(doc, "section", "cg-card");
+  infraCard.appendChild(
+    el(doc, "div", "cg-card-title", `MCP Servers (${fp.mcpServers.length}) & Hooks (${fp.hooks.length})`),
+  );
+  for (const m of fp.mcpServers) {
+    const row = el(doc, "div", "cg-subcard");
+    const top = el(doc, "div", "cg-subcard-row");
+    top.appendChild(el(doc, "span", "cg-label", `${m.name} (${m.scope})`));
+    top.appendChild(
+      el(doc, "span", "cg-muted cg-nums", m.enabled ? `~${m.estTokens} est. tok · ${m.envKeyCount} env keys` : "disabled"),
+    );
+    row.appendChild(top);
+    if (m.commandPreview) row.appendChild(el(doc, "div", "cg-path", m.commandPreview));
+    infraCard.appendChild(row);
+  }
+  for (const h of fp.hooks) {
+    const row = el(doc, "div", "cg-subcard");
+    const top = el(doc, "div", "cg-subcard-row");
+    top.appendChild(el(doc, "span", "cg-label", `hook: ${h.name} (${h.scope})`));
+    top.appendChild(el(doc, "span", "cg-muted", h.events.join(", ")));
+    row.appendChild(top);
+    infraCard.appendChild(row);
+  }
+  nodes.push(infraCard);
+
+  return nodes;
+}
+
 function syncDraftFromStatus(state: DashboardState, status: StatusPayload): void {
   if (state.settingsOpen) return;
   state.settingsDraft = {
@@ -1876,6 +2594,8 @@ function syncDraftFromStatus(state: DashboardState, status: StatusPayload): void
     warnPercent: status.warnPercent,
     mode: status.mode,
     autoRefreshSeconds: state.autoRefreshSeconds,
+    loopGuard: status.loopGuard ? { ...status.loopGuard } : { ...DEFAULT_LOOP_GUARD_DRAFT },
+    alerts: status.alerts ? { ...status.alerts } : { ...DEFAULT_ALERTS_DRAFT },
   };
 }
 
@@ -1918,6 +2638,12 @@ export async function mountDashboard(
     overviewLimit: 20,
     statusData: null,
     overviewData: null,
+    searchData: null,
+    footprintData: null,
+    searchQuery: "",
+    searchScope: "all",
+    searchIncludeSubagents: false,
+    footprintWorkspaceInput: "",
     quotaData: null,
     handoffData: null,
     handoffSentToNewChat: false,
@@ -1930,6 +2656,8 @@ export async function mountDashboard(
       warnPercent: 80,
       mode: "stop",
       autoRefreshSeconds: DEFAULT_AUTO_REFRESH_SECONDS,
+      loopGuard: { ...DEFAULT_LOOP_GUARD_DRAFT },
+      alerts: { ...DEFAULT_ALERTS_DRAFT },
     },
     banner: null,
     hostCapabilities: undefined,
@@ -1941,6 +2669,7 @@ export async function mountDashboard(
   let initialFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   let autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
   let quotaPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let quotaPollAttempts = 0;
   let disposed = false;
 
@@ -2163,6 +2892,23 @@ export async function mountDashboard(
       scheduleQuotaPollIfFetching();
       return;
     }
+    if (isSearchPayload(sc)) {
+      state.searchData = sc;
+      if (options.switchView !== false) {
+        state.currentView = "search";
+      }
+      return;
+    }
+    if (isFootprintPayload(sc)) {
+      state.footprintData = sc;
+      if (!state.footprintWorkspaceInput && sc.workspacePath) {
+        state.footprintWorkspaceInput = sc.workspacePath;
+      }
+      if (options.switchView !== false) {
+        state.currentView = "footprint";
+      }
+      return;
+    }
     if (isHandoffPayload(sc)) {
       state.handoffData = sc;
       state.handoffOpen = true;
@@ -2198,11 +2944,23 @@ export async function mountDashboard(
       clearInitialFallbackTimer();
       stopAutoRefreshTimer();
       stopQuotaPollTimer();
+      if (searchDebounceTimer !== null) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = null;
+      }
       doc.removeEventListener?.("visibilitychange", onVisibilityChange);
     },
 
     async refreshCurrentView(skipIfBusy = false): Promise<void> {
       const requestedView = state.currentView;
+      if (requestedView === "search") {
+        await controller.runSearch(state.searchQuery, state.searchScope, state.searchIncludeSubagents);
+        return;
+      }
+      if (requestedView === "footprint") {
+        await controller.refreshFootprint(state.footprintWorkspaceInput);
+        return;
+      }
       const args: Record<string, unknown> =
         requestedView === "overview"
           ? { view: "overview", limit: state.overviewLimit }
@@ -2234,6 +2992,79 @@ export async function mountDashboard(
       });
       if (res?.structuredContent) {
         applyStructuredResult(res.structuredContent, { switchView: true });
+        render();
+      }
+    },
+
+    async switchToSearch(): Promise<void> {
+      state.userSwitchedView = true;
+      state.currentView = "search";
+      render();
+      await controller.runSearch(state.searchQuery, state.searchScope, state.searchIncludeSubagents);
+    },
+
+    async switchToFootprint(workspacePath?: string): Promise<void> {
+      state.userSwitchedView = true;
+      state.currentView = "footprint";
+      render();
+      await controller.refreshFootprint(workspacePath ?? state.footprintWorkspaceInput);
+    },
+
+    async runSearch(
+      query = state.searchQuery,
+      scope = state.searchScope,
+      includeSubagents = state.searchIncludeSubagents,
+    ): Promise<void> {
+      state.searchQuery = query;
+      state.searchScope = scope;
+      state.searchIncludeSubagents = includeSubagents;
+      const res = await invokeServerTool("app_search", {
+        query,
+        scope,
+        includeSubagents,
+        limit: 25,
+      });
+      if (res?.structuredContent) {
+        applyStructuredResult(res.structuredContent, { switchView: false });
+        render();
+      }
+    },
+
+    async refreshFootprint(workspacePath = state.footprintWorkspaceInput): Promise<void> {
+      const args: Record<string, unknown> = {};
+      if (workspacePath && workspacePath.trim()) {
+        args.workspacePath = workspacePath.trim();
+      }
+      if (state.activeConversationId) {
+        args.conversationId = state.activeConversationId;
+      }
+      const res = await invokeServerTool("app_footprint", args);
+      if (res?.structuredContent) {
+        applyStructuredResult(res.structuredContent, { switchView: false });
+        render();
+      }
+    },
+
+    async clearActiveLoop(): Promise<void> {
+      const args: Record<string, unknown> = {};
+      if (state.activeConversationId) {
+        args.conversationId = state.activeConversationId;
+      }
+      const res = await invokeServerTool("app_clear_loop", args);
+      if (res?.structuredContent) {
+        applyStructuredResult(res.structuredContent, { switchView: false });
+        state.banner = { kind: "info", text: "Loop Guard alert dismissed." };
+        render();
+      }
+    },
+
+    async triggerTestAlert(): Promise<void> {
+      const res = await invokeServerTool("app_test_alert", {});
+      if (res?.structuredContent) {
+        const sc = res.structuredContent as Record<string, unknown>;
+        state.banner = sc.sent
+          ? { kind: "success", text: "Test sound & notification triggered." }
+          : { kind: "info", text: `Test alert skipped (${String(sc.reason || "disabled")}).` };
         render();
       }
     },
@@ -2447,6 +3278,12 @@ export async function mountDashboard(
       if (hasRefreshSeconds) {
         args.autoRefreshSeconds = refreshSecs;
       }
+      if (draft.loopGuard) {
+        args.loopGuard = draft.loopGuard;
+      }
+      if (draft.alerts) {
+        args.alerts = draft.alerts;
+      }
       if (state.activeConversationId) {
         args.conversationId = state.activeConversationId;
       }
@@ -2551,23 +3388,38 @@ export async function mountDashboard(
     render();
   };
 
+  const scheduleSearchQuery = (query: string): void => {
+    state.searchQuery = query;
+    if (searchDebounceTimer !== null) {
+      clearTimeout(searchDebounceTimer);
+    }
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      void controller.runSearch(state.searchQuery, state.searchScope, state.searchIncludeSubagents);
+    }, 250);
+  };
+
+  const copySearchResultContext = async (item: SearchResultItem): Promise<void> => {
+    const lines = [
+      `## ${item.title || item.convId} (${item.convId})`,
+      item.editedFiles?.length ? `Edited files: ${item.editedFiles.join(", ")}` : "",
+      ...(item.snippets || []).map((s) => `- [${s.source}] ${s.text}`),
+    ].filter(Boolean);
+    const copied = await copyPlainText(doc, lines.join("\n"));
+    state.banner = copied
+      ? { kind: "success", text: "Matched chat context copied to clipboard." }
+      : { kind: "info", text: "Unable to access clipboard." };
+    render();
+  };
+
   const render = (): void => {
     const root = doc.getElementById("app");
     if (!root) return;
 
-    const shell = el(doc, "main", "cg-shell");
-    shell.appendChild(renderHeader(doc, state, controller, toggleAutoRefresh));
-
-    const banner = renderBanner(doc, state, () => {
-      state.banner = null;
-      render();
-    });
-    if (banner) shell.appendChild(banner);
-
     const toggleSettings = (): void => {
       state.settingsOpen = !state.settingsOpen;
       if (state.settingsOpen) {
-        if (state.currentView === "status" && state.statusData) {
+        if (state.statusData) {
           state.settingsDraft = {
             enabled: state.statusData.enabled,
             thresholdTokens:
@@ -2576,6 +3428,12 @@ export async function mountDashboard(
             warnPercent: state.statusData.warnPercent,
             mode: state.statusData.mode,
             autoRefreshSeconds: state.autoRefreshSeconds,
+            loopGuard: state.statusData.loopGuard
+              ? { ...state.statusData.loopGuard }
+              : { ...DEFAULT_LOOP_GUARD_DRAFT },
+            alerts: state.statusData.alerts
+              ? { ...state.statusData.alerts }
+              : { ...DEFAULT_ALERTS_DRAFT },
           };
         } else if (state.overviewData) {
           state.settingsDraft = {
@@ -2584,11 +3442,22 @@ export async function mountDashboard(
             warnPercent: state.overviewData.warnPercent,
             mode: state.overviewData.mode,
             autoRefreshSeconds: state.autoRefreshSeconds,
+            loopGuard: { ...DEFAULT_LOOP_GUARD_DRAFT },
+            alerts: { ...DEFAULT_ALERTS_DRAFT },
           };
         }
       }
       render();
     };
+
+    const shell = el(doc, "main", "cg-shell");
+    shell.appendChild(renderHeader(doc, state, controller, toggleAutoRefresh, toggleSettings));
+
+    const banner = renderBanner(doc, state, () => {
+      state.banner = null;
+      render();
+    });
+    if (banner) shell.appendChild(banner);
 
     const settingsNode = renderSettingsDrawer(
       doc,
@@ -2614,7 +3483,25 @@ export async function mountDashboard(
       },
     );
 
-    if (state.currentView === "overview" && state.overviewData) {
+    if (state.currentView === "search") {
+      if (settingsNode) shell.appendChild(settingsNode);
+      for (const node of renderSearchView(
+        doc,
+        state,
+        controller,
+        scheduleSearchQuery,
+        (item) => {
+          void copySearchResultContext(item);
+        },
+      )) {
+        shell.appendChild(node);
+      }
+    } else if (state.currentView === "footprint") {
+      if (settingsNode) shell.appendChild(settingsNode);
+      for (const node of renderSetupView(doc, state, controller)) {
+        shell.appendChild(node);
+      }
+    } else if (state.currentView === "overview" && state.overviewData) {
       if (settingsNode) shell.appendChild(settingsNode);
       if (handoffNode) shell.appendChild(handoffNode);
       const overviewNodes = renderOverviewView(
@@ -2622,7 +3509,6 @@ export async function mountDashboard(
         state.overviewData,
         state,
         controller,
-        toggleSettings,
         () => {
           state.hideSubagents = !state.hideSubagents;
           render();
@@ -2638,6 +3524,15 @@ export async function mountDashboard(
         shell.appendChild(node);
       }
     } else if (state.statusData) {
+      const loopBanner = renderLoopBanner(
+        doc,
+        state.statusData.activeLoop,
+        state.loading,
+        () => {
+          void controller.clearActiveLoop();
+        },
+      );
+      if (loopBanner) shell.appendChild(loopBanner);
       shell.appendChild(
         renderDetailSubheader(
           doc,
@@ -2659,7 +3554,6 @@ export async function mountDashboard(
           state.statusData,
           state,
           controller,
-          toggleSettings,
         ),
       );
       if (handoffNode) shell.appendChild(handoffNode);
@@ -2672,7 +3566,7 @@ export async function mountDashboard(
           "div",
           undefined,
           state.connected
-            ? "Loading Context Guard telemetry..."
+            ? "Loading Agy Lens telemetry..."
             : "Waiting for MCP App host connection...",
         ),
       );

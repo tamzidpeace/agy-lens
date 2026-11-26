@@ -1,12 +1,14 @@
-"""Shared core engine for the context-guard Antigravity plugin.
+"""Shared core engine for the agy-lens (formerly context-guard) Antigravity plugin.
 
 Provides stdlib-only (Python 3.9+) transcript parsing, compaction detection,
-bloat attribution, atomic config/state persistence, transcript discovery,
+bloat attribution, locked atomic config/state persistence, transcript discovery,
 status/overview payload generation, and smart handoff brief construction.
 """
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import os
 import re
@@ -14,9 +16,15 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 DEFAULT_THRESHOLD_TOKENS = 300_000
 DEFAULT_WARN_PERCENT = 80
@@ -35,6 +43,34 @@ DEFAULT_MODEL_WINDOWS: dict[str, int] = {
     "gpt-4o": 128_000,
     "default": 1_048_576,
 }
+
+DEFAULT_LOOP_GUARD: dict[str, Any] = {
+    "enabled": True,
+    "consecutiveThreshold": 3,
+    "nudgeOncePerStreak": True,
+    "autoPauseThreshold": 5,
+}
+MIN_LOOP_CONSECUTIVE_THRESHOLD = 2
+MAX_LOOP_CONSECUTIVE_THRESHOLD = 6
+MIN_LOOP_AUTO_PAUSE_THRESHOLD = 4
+MAX_LOOP_AUTO_PAUSE_THRESHOLD = 10
+MAX_LOOP_HISTORY_ITEMS = 10
+
+DEFAULT_ALERTS: dict[str, Any] = {
+    "soundEnabled": True,
+    "desktopNotificationEnabled": True,
+    "notifyOnStop": True,
+    "notifyOnThreshold": True,
+    "notifyOnLoop": True,
+    "notifyOnLowQuotaPct": 15,
+    "cooldownSeconds": 15,
+    "lastAlertAtByKind": {},
+    "lastLowQuotaAlertByGroup": {},
+}
+MIN_LOW_QUOTA_ALERT_PCT = 0
+MAX_LOW_QUOTA_ALERT_PCT = 50
+MIN_ALERT_COOLDOWN_SECONDS = 0
+MAX_ALERT_COOLDOWN_SECONDS = 300
 
 MIN_THRESHOLD_TOKENS = 1_000
 MAX_CONVERSATIONS_STORED = 200
@@ -77,10 +113,10 @@ _PBTXT_UNESCAPE = {"n": " ", "r": " ", "t": " ", '"': '"', "\\": "\\"}
 MAX_TITLE_CHARS = 72
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    """Coerce numeric values to int, ignoring booleans and invalid values."""
+def _parse_int(value: Any) -> int | None:
+    """Parse an integer from numeric or string input, returning None for bools/invalid."""
     if isinstance(value, bool):
-        return default
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -89,8 +125,14 @@ def _safe_int(value: Any, default: int = 0) -> int:
         try:
             return int(value.strip())
         except ValueError:
-            return default
-    return default
+            return None
+    return None
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce numeric values to int, ignoring booleans and invalid values."""
+    parsed = _parse_int(value)
+    return default if parsed is None else parsed
 
 
 def _text_of(value: Any) -> str:
@@ -162,6 +204,97 @@ def _append_unique_recent(items: list[str], value: str, max_items: int) -> None:
         del items[0]
 
 
+def _sanitize_loop_dict(raw: Any) -> dict[str, Any] | None:
+    """Return a deep-copied dict with non-empty string keys, or None if invalid."""
+    if not isinstance(raw, dict):
+        return None
+    return {k: copy.deepcopy(v) for k, v in raw.items() if isinstance(k, str) and k}
+
+
+def _normalize_loop_guard(raw: Any, base: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize and clamp loopGuard settings against defaults or base."""
+    out = copy.deepcopy(base if base is not None else DEFAULT_LOOP_GUARD)
+    if not isinstance(raw, dict):
+        return out
+
+    if isinstance(raw.get("enabled"), bool):
+        out["enabled"] = raw["enabled"]
+    if isinstance(raw.get("nudgeOncePerStreak"), bool):
+        out["nudgeOncePerStreak"] = raw["nudgeOncePerStreak"]
+
+    consecutive = _parse_int(raw.get("consecutiveThreshold"))
+    if consecutive is not None:
+        out["consecutiveThreshold"] = max(
+            MIN_LOOP_CONSECUTIVE_THRESHOLD,
+            min(MAX_LOOP_CONSECUTIVE_THRESHOLD, consecutive),
+        )
+
+    auto_pause = _parse_int(raw.get("autoPauseThreshold"))
+    if auto_pause is not None:
+        if auto_pause <= 0:
+            out["autoPauseThreshold"] = 0
+        else:
+            out["autoPauseThreshold"] = max(
+                MIN_LOOP_AUTO_PAUSE_THRESHOLD,
+                min(MAX_LOOP_AUTO_PAUSE_THRESHOLD, auto_pause),
+            )
+    return out
+
+
+def _sanitize_alert_timestamps(raw: Any) -> dict[str, int | float | str]:
+    """Keep valid string-keyed numeric or string alert timestamps."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, int | float | str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            cleaned[k] = v
+        elif isinstance(v, str) and v:
+            cleaned[k] = v
+    return cleaned
+
+
+def _normalize_alerts(raw: Any, base: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize and clamp alerts settings against defaults or base."""
+    out = copy.deepcopy(base if base is not None else DEFAULT_ALERTS)
+    if not isinstance(raw, dict):
+        return out
+
+    for bool_key in (
+        "soundEnabled",
+        "desktopNotificationEnabled",
+        "notifyOnStop",
+        "notifyOnThreshold",
+        "notifyOnLoop",
+    ):
+        if isinstance(raw.get(bool_key), bool):
+            out[bool_key] = raw[bool_key]
+
+    low_quota_pct = _parse_int(raw.get("notifyOnLowQuotaPct"))
+    if low_quota_pct is not None:
+        out["notifyOnLowQuotaPct"] = max(
+            MIN_LOW_QUOTA_ALERT_PCT,
+            min(MAX_LOW_QUOTA_ALERT_PCT, low_quota_pct),
+        )
+
+    cooldown = _parse_int(raw.get("cooldownSeconds"))
+    if cooldown is not None:
+        out["cooldownSeconds"] = max(
+            MIN_ALERT_COOLDOWN_SECONDS,
+            min(MAX_ALERT_COOLDOWN_SECONDS, cooldown),
+        )
+
+    if isinstance(raw.get("lastAlertAtByKind"), dict):
+        out["lastAlertAtByKind"] = _sanitize_alert_timestamps(raw["lastAlertAtByKind"])
+    if isinstance(raw.get("lastLowQuotaAlertByGroup"), dict):
+        out["lastLowQuotaAlertByGroup"] = _sanitize_alert_timestamps(
+            raw["lastLowQuotaAlertByGroup"]
+        )
+    return out
+
+
 def _default_conversation_state() -> dict[str, Any]:
     """Return fresh per-conversation state with -1 epoch sentinels."""
     return {
@@ -174,6 +307,8 @@ def _default_conversation_state() -> dict[str, Any]:
         "lastTokens": 0,
         "lastModel": "",
         "updatedAt": "",
+        "loopHistory": [],
+        "activeLoop": None,
     }
 
 
@@ -205,6 +340,17 @@ def _normalize_conversation_state(raw: Any) -> dict[str, Any]:
     updated_at = raw.get("updatedAt")
     if isinstance(updated_at, str):
         state["updatedAt"] = updated_at
+
+    raw_loop_history = raw.get("loopHistory")
+    if isinstance(raw_loop_history, list):
+        sanitized_history: list[dict[str, Any]] = []
+        for entry in raw_loop_history:
+            cleaned = _sanitize_loop_dict(entry)
+            if cleaned is not None:
+                sanitized_history.append(cleaned)
+        state["loopHistory"] = sanitized_history[-MAX_LOOP_HISTORY_ITEMS:]
+
+    state["activeLoop"] = _sanitize_loop_dict(raw.get("activeLoop"))
     return state
 
 
@@ -219,27 +365,31 @@ def _default_config() -> dict[str, Any]:
         "modelWindows": dict(DEFAULT_MODEL_WINDOWS),
         "lastActiveConversationId": None,
         "conversations": {},
+        "loopGuard": copy.deepcopy(DEFAULT_LOOP_GUARD),
+        "alerts": copy.deepcopy(DEFAULT_ALERTS),
     }
 
 
+def _has_config_path_override() -> bool:
+    """Return True if an explicit config path env override is configured."""
+    return bool(
+        os.environ.get("AGY_LENS_CONFIG_PATH", "").strip()
+        or os.environ.get("CONTEXT_GUARD_CONFIG_PATH", "").strip()
+    )
+
+
 def get_config_path() -> Path:
-    """Return config file path, honoring CONTEXT_GUARD_CONFIG_PATH if set."""
-    override = os.environ.get("CONTEXT_GUARD_CONFIG_PATH", "").strip()
-    if override:
-        return Path(os.path.expanduser(override))
-    return Path.home() / ".gemini" / "config" / "context-guard.json"
+    """Return config file path, honoring AGY_LENS_CONFIG_PATH then legacy CONTEXT_GUARD_CONFIG_PATH."""
+    for env_var in ("AGY_LENS_CONFIG_PATH", "CONTEXT_GUARD_CONFIG_PATH"):
+        override = os.environ.get(env_var, "").strip()
+        if override:
+            return Path(os.path.expanduser(override))
+    return Path.home() / ".gemini" / "config" / "agy-lens.json"
 
 
-def load_config() -> dict[str, Any]:
-    """Load config from disk, returning sanitized defaults on missing/corrupt files."""
+def _normalize_config(raw: Any) -> dict[str, Any]:
+    """Normalize a raw config dict against defaults and validation bounds."""
     config = _default_config()
-    path = get_config_path()
-    try:
-        raw_text = path.read_text(encoding="utf-8")
-        raw = json.loads(raw_text)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        return config
-
     if not isinstance(raw, dict):
         return config
 
@@ -286,7 +436,87 @@ def load_config() -> dict[str, Any]:
                 convs[cid] = _normalize_conversation_state(entry)
         config["conversations"] = convs
 
+    config["loopGuard"] = _normalize_loop_guard(raw.get("loopGuard"))
+    config["alerts"] = _normalize_alerts(raw.get("alerts"))
     return config
+
+
+def load_config() -> dict[str, Any]:
+    """Load config from disk (falling back to legacy context-guard.json on read)."""
+    path = get_config_path()
+    if not path.exists() and not _has_config_path_override():
+        legacy_path = path.parent / "context-guard.json"
+        if legacy_path.is_file():
+            path = legacy_path
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return _default_config()
+    return _normalize_config(raw)
+
+
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _get_thread_lock(lock_key: str) -> threading.Lock:
+    """Return a process-local lock for lock_key to pair with advisory flock."""
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[lock_key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Acquire an exclusive advisory lock on `<path>.lock` across threads and processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / f"{path.name}.lock"
+    thread_lock = _get_thread_lock(str(lock_path.resolve()))
+    with thread_lock:
+        if fcntl is None:
+            yield
+            return
+        with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+def save_json_locked(path: Path, data: dict[str, Any]) -> None:
+    """Persist JSON to path atomically under an exclusive advisory file lock."""
+    with _file_lock(path):
+        _save_json_atomic(path, data)
+
+
+def update_json_locked(
+    path: Path,
+    updater: Callable[[dict[str, Any]], dict[str, Any]],
+    *,
+    default: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read-modify-write a JSON object atomically under `<path>.lock`."""
+    with _file_lock(path):
+        current: dict[str, Any] | None = None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                current = raw
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            current = None
+        if current is None:
+            current = copy.deepcopy(default) if default is not None else {}
+        updated = updater(current)
+        _save_json_atomic(path, updated)
+        return updated
 
 
 def _is_protected_conversation(
@@ -337,39 +567,15 @@ def _prune_conversations(
 
 
 def save_config(config: dict[str, Any]) -> Path:
-    """Prune stale conversations and atomically persist config to disk."""
+    """Prune stale conversations and atomically persist config under lock."""
     path = get_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     raw_convs = config.get("conversations")
     if isinstance(raw_convs, dict):
         last_active = config.get("lastActiveConversationId")
         active_id = last_active if isinstance(last_active, str) else None
         config["conversations"] = _prune_conversations(raw_convs, active_id)
 
-    payload = json.dumps(config, indent=2, sort_keys=False) + "\n"
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=".context-guard.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp_file:
-            tmp_path = tmp_file.name
-            tmp_file.write(payload)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, path)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    save_json_locked(path, config)
     return path
 
 
@@ -480,7 +686,10 @@ def resolve_model_window(model_name: str, config: dict[str, Any]) -> int:
 
 def get_brain_roots() -> list[Path]:
     """Return deduplicated Antigravity data root directories."""
-    override = os.environ.get("CONTEXT_GUARD_BRAIN_ROOTS", "").strip()
+    override = (
+        os.environ.get("AGY_LENS_BRAIN_ROOTS", "").strip()
+        or os.environ.get("CONTEXT_GUARD_BRAIN_ROOTS", "").strip()
+    )
     candidates: list[Path] = []
     if override:
         for chunk in override.split(os.pathsep):
@@ -801,6 +1010,7 @@ def _empty_analysis(transcript_path: str) -> dict[str, Any]:
         "compactionCount": 0,
         "activeEpochStep": 0,
         "compactions": [],
+        "firstTurnTokens": None,
         "history": [],
         "bloatByCategory": {
             "user": 0,
@@ -1138,11 +1348,14 @@ def analyze_transcript(transcript_path: str | Path) -> dict[str, Any]:
     result["pendingDeltaTokens"] = pending_delta
     result["effectiveTokens"] = result["totalTokens"] + pending_delta
     result["cacheHitPercent"] = cache_hit
+    epoch_step = result["activeEpochStep"]
+    epoch_history = [item for item in history if item["stepIndex"] >= epoch_step]
     result["compactions"] = compactions
-    result["history"] = history[-MAX_HISTORY_ITEMS:]
+    result["firstTurnTokens"] = history[0]["totalTokens"] if history else None
+    result["history"] = epoch_history[-MAX_HISTORY_ITEMS:]
     result["bloatByCategory"] = bloat_by_cat
     result["topBloatSteps"] = top_bloat
-    result["avgDeltaPerTurn"] = _compute_avg_delta(history, result["activeEpochStep"])
+    result["avgDeltaPerTurn"] = _compute_avg_delta(epoch_history, epoch_step)
     result["firstUserPrompt"] = user_prompts[0] if user_prompts else ""
     result["recentUserPrompts"] = user_prompts[-MAX_RECENT_PROMPTS:]
     result["recentFiles"] = recent_files
@@ -1492,7 +1705,7 @@ def _rearm_epochs_on_increase(
 
 
 def update_settings(
-    config: dict[str, Any],
+    config: dict[str, Any] | None = None,
     *,
     threshold_tokens: int | None = None,
     warn_percent: int | None = None,
@@ -1504,9 +1717,11 @@ def update_settings(
     snooze_delta: int | None = None,
     snooze_until_tokens: int | None = None,
     reset_snooze: bool = False,
+    loop_guard_patch: dict[str, Any] | None = None,
+    alerts_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate, update, and persist global or per-conversation Context Guard settings."""
-    # Validate inputs before mutating config or touching disk.
+    """Validate, update, and persist global or per-conversation Agy Lens settings under lock."""
+    # Validate inputs before acquiring locks or touching disk.
     if mode is not None and mode not in VALID_MODES:
         raise ValueError(f"Invalid mode {mode!r}; expected one of {VALID_MODES}")
     if snooze_delta is not None and (isinstance(snooze_delta, bool) or _safe_int(snooze_delta, -1) < 0):
@@ -1515,6 +1730,10 @@ def update_settings(
         isinstance(snooze_until_tokens, bool) or _safe_int(snooze_until_tokens, -1) < 0
     ):
         raise ValueError("snooze_until_tokens must be a non-negative integer")
+    if loop_guard_patch is not None and not isinstance(loop_guard_patch, dict):
+        raise ValueError("loop_guard_patch must be a dict")
+    if alerts_patch is not None and not isinstance(alerts_patch, dict):
+        raise ValueError("alerts_patch must be a dict")
 
     needs_conv = any(
         (
@@ -1524,92 +1743,172 @@ def update_settings(
             reset_snooze,
         )
     )
-    target_conv_id: str | None = conv_id
-    if needs_conv and not target_conv_id:
-        last_active = config.get("lastActiveConversationId")
-        if isinstance(last_active, str) and last_active.strip():
-            target_conv_id = last_active
+    path = get_config_path()
+
+    def _merge_mem_into_base(base: dict[str, Any]) -> None:
+        if config is None:
+            return
+        mem_convs = config.get("conversations")
+        if isinstance(mem_convs, dict):
+            for cid, mem_entry in mem_convs.items():
+                if not isinstance(cid, str) or not cid or not isinstance(mem_entry, dict):
+                    continue
+                disk_entry = base["conversations"].get(cid)
+                if disk_entry is not None:
+                    disk_ts = str(disk_entry.get("updatedAt") or "")
+                    mem_ts = str(mem_entry.get("updatedAt") or "")
+                    if disk_ts > mem_ts:
+                        continue
+                base["conversations"][cid] = _normalize_conversation_state(mem_entry)
+        if not base.get("lastActiveConversationId"):
+            mem_active = config.get("lastActiveConversationId")
+            if isinstance(mem_active, str) and mem_active.strip():
+                base["lastActiveConversationId"] = mem_active
+
+    def _apply_update(disk_raw: dict[str, Any]) -> dict[str, Any]:
+        if disk_raw:
+            base = _normalize_config(disk_raw)
+            _merge_mem_into_base(base)
+        elif not _has_config_path_override() and (path.parent / "context-guard.json").is_file():
+            base = load_config()
+            _merge_mem_into_base(base)
+        elif config is not None:
+            base = _normalize_config(config)
         else:
-            recent = list_recent_transcripts(1)
-            if recent:
-                target_conv_id = recent[0]["conversationId"]
-    if needs_conv and not target_conv_id:
-        raise ValueError("conv_id is required when updating per-conversation settings")
+            base = _default_config()
 
-    existing_convs = config.get("conversations")
-    old_thresholds: dict[str, int] = (
-        {
-            cid: resolve_effective_threshold(config, cid)
-            for cid in existing_convs
-            if isinstance(cid, str)
-        }
-        if isinstance(existing_convs, dict)
-        else {}
-    )
-    if target_conv_id and target_conv_id not in old_thresholds:
-        old_thresholds[target_conv_id] = resolve_effective_threshold(config, target_conv_id)
+        target_conv_id: str | None = conv_id
+        if needs_conv and not target_conv_id:
+            last_active = base.get("lastActiveConversationId")
+            if isinstance(last_active, str) and last_active.strip():
+                target_conv_id = last_active
+            else:
+                recent = list_recent_transcripts(1)
+                if recent:
+                    target_conv_id = recent[0]["conversationId"]
+        if needs_conv and not target_conv_id:
+            raise ValueError("conv_id is required when updating per-conversation settings")
 
-    if threshold_tokens is not None and not isinstance(threshold_tokens, bool):
-        config["thresholdTokens"] = max(MIN_THRESHOLD_TOKENS, _safe_int(threshold_tokens, DEFAULT_THRESHOLD_TOKENS))
-
-    if warn_percent is not None and not isinstance(warn_percent, bool):
-        config["warnPercent"] = max(1, min(99, _safe_int(warn_percent, DEFAULT_WARN_PERCENT)))
-
-    if mode is not None:
-        config["mode"] = mode
-
-    if enabled is not None:
-        config["enabled"] = bool(enabled)
-
-    if auto_refresh_seconds is not None and not isinstance(auto_refresh_seconds, bool):
-        config["autoRefreshSeconds"] = max(
-            MIN_AUTO_REFRESH_SECONDS,
-            min(
-                MAX_AUTO_REFRESH_SECONDS,
-                _safe_int(auto_refresh_seconds, DEFAULT_AUTO_REFRESH_SECONDS),
-            ),
+        existing_convs = base.get("conversations")
+        old_thresholds: dict[str, int] = (
+            {
+                cid: resolve_effective_threshold(base, cid)
+                for cid in existing_convs
+                if isinstance(cid, str)
+            }
+            if isinstance(existing_convs, dict)
+            else {}
         )
+        if target_conv_id and target_conv_id not in old_thresholds:
+            old_thresholds[target_conv_id] = resolve_effective_threshold(base, target_conv_id)
 
-    cached_target_tokens: int | None = None
-    if needs_conv and target_conv_id:
-        conv_state = get_conversation_state(config, target_conv_id)
-
-        if custom_threshold_tokens is not None and not isinstance(custom_threshold_tokens, bool):
-            parsed_custom = _safe_int(custom_threshold_tokens, 0)
-            conv_state["customThresholdTokens"] = (
-                max(MIN_THRESHOLD_TOKENS, parsed_custom) if parsed_custom > 0 else None
+        if threshold_tokens is not None and not isinstance(threshold_tokens, bool):
+            base["thresholdTokens"] = max(
+                MIN_THRESHOLD_TOKENS,
+                _safe_int(threshold_tokens, DEFAULT_THRESHOLD_TOKENS),
             )
 
-        if reset_snooze:
-            conv_state["snoozedUntilTokens"] = 0
-            conv_state["alertedAtEpoch"] = -1
+        if warn_percent is not None and not isinstance(warn_percent, bool):
+            base["warnPercent"] = max(1, min(99, _safe_int(warn_percent, DEFAULT_WARN_PERCENT)))
 
-        if snooze_until_tokens is not None:
-            conv_state["snoozedUntilTokens"] = max(0, _safe_int(snooze_until_tokens, 0))
+        if mode is not None:
+            base["mode"] = mode
 
-        if snooze_delta is not None:
-            delta_val = max(0, _safe_int(snooze_delta, 0))
-            cached_target_tokens = _current_effective_tokens(config, target_conv_id)
-            current_threshold = resolve_effective_threshold(config, target_conv_id)
-            conv_state["snoozedUntilTokens"] = max(cached_target_tokens, current_threshold) + delta_val
+        if enabled is not None:
+            base["enabled"] = bool(enabled)
 
-    _rearm_epochs_on_increase(
-        config,
-        old_thresholds,
-        target_conv_id=target_conv_id,
-        target_tokens=cached_target_tokens,
+        if auto_refresh_seconds is not None and not isinstance(auto_refresh_seconds, bool):
+            base["autoRefreshSeconds"] = max(
+                MIN_AUTO_REFRESH_SECONDS,
+                min(
+                    MAX_AUTO_REFRESH_SECONDS,
+                    _safe_int(auto_refresh_seconds, DEFAULT_AUTO_REFRESH_SECONDS),
+                ),
+            )
+
+        if loop_guard_patch is not None:
+            merged_lg = {**base.get("loopGuard", DEFAULT_LOOP_GUARD), **loop_guard_patch}
+            base["loopGuard"] = _normalize_loop_guard(merged_lg, base=base.get("loopGuard"))
+
+        if alerts_patch is not None:
+            merged_alerts = {**base.get("alerts", DEFAULT_ALERTS), **alerts_patch}
+            base["alerts"] = _normalize_alerts(merged_alerts, base=base.get("alerts"))
+
+        cached_target_tokens: int | None = None
+        if needs_conv and target_conv_id:
+            conv_state = get_conversation_state(base, target_conv_id)
+
+            if custom_threshold_tokens is not None and not isinstance(custom_threshold_tokens, bool):
+                parsed_custom = _safe_int(custom_threshold_tokens, 0)
+                conv_state["customThresholdTokens"] = (
+                    max(MIN_THRESHOLD_TOKENS, parsed_custom) if parsed_custom > 0 else None
+                )
+
+            if reset_snooze:
+                conv_state["snoozedUntilTokens"] = 0
+                conv_state["alertedAtEpoch"] = -1
+
+            if snooze_until_tokens is not None:
+                conv_state["snoozedUntilTokens"] = max(0, _safe_int(snooze_until_tokens, 0))
+
+            if snooze_delta is not None:
+                delta_val = max(0, _safe_int(snooze_delta, 0))
+                cached_target_tokens = _current_effective_tokens(base, target_conv_id)
+                current_threshold = resolve_effective_threshold(base, target_conv_id)
+                conv_state["snoozedUntilTokens"] = max(cached_target_tokens, current_threshold) + delta_val
+
+        _rearm_epochs_on_increase(
+            base,
+            old_thresholds,
+            target_conv_id=target_conv_id,
+            target_tokens=cached_target_tokens,
+        )
+
+        raw_convs = base.get("conversations")
+        if isinstance(raw_convs, dict):
+            last_active = base.get("lastActiveConversationId")
+            active_id = last_active if isinstance(last_active, str) else None
+            base["conversations"] = _prune_conversations(raw_convs, active_id)
+
+        return base
+
+    saved = update_json_locked(path, _apply_update, default=None)
+
+    if config is not None:
+        existing_convs = config.get("conversations")
+        old_convs = existing_convs if isinstance(existing_convs, dict) else {}
+        new_convs = saved.get("conversations", {})
+        synced_convs: dict[str, dict[str, Any]] = {}
+        for cid, new_entry in new_convs.items():
+            old_entry = old_convs.get(cid)
+            if isinstance(old_entry, dict):
+                old_entry.clear()
+                old_entry.update(new_entry)
+                synced_convs[cid] = old_entry
+            else:
+                synced_convs[cid] = new_entry
+        config.clear()
+        config.update(saved)
+        config["conversations"] = synced_convs
+        return config
+    return saved
+
+
+def _has_quota_path_override() -> bool:
+    """Return True if an explicit quota cache path env override is configured."""
+    return bool(
+        os.environ.get("AGY_LENS_QUOTA_PATH", "").strip()
+        or os.environ.get("CONTEXT_GUARD_QUOTA_PATH", "").strip()
     )
-
-    save_config(config)
-    return config
 
 
 def get_quota_cache_path() -> Path:
-    """Return quota cache path, honoring CONTEXT_GUARD_QUOTA_PATH or alongside config."""
-    override = os.environ.get("CONTEXT_GUARD_QUOTA_PATH", "").strip()
-    if override:
-        return Path(os.path.expanduser(override))
-    return get_config_path().parent / "context-guard-quota.json"
+    """Return quota cache path, honoring AGY_LENS_QUOTA_PATH then CONTEXT_GUARD_QUOTA_PATH."""
+    for env_var in ("AGY_LENS_QUOTA_PATH", "CONTEXT_GUARD_QUOTA_PATH"):
+        override = os.environ.get(env_var, "").strip()
+        if override:
+            return Path(os.path.expanduser(override))
+    return get_config_path().parent / "agy-lens-quota.json"
 
 
 def _save_json_atomic(path: Path, data: dict[str, Any]) -> None:
@@ -1621,6 +1920,8 @@ def _save_json_atomic(path: Path, data: dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
     finally:
@@ -1783,9 +2084,13 @@ def load_quota_cache(
     ttl_seconds: int = DEFAULT_QUOTA_TTL_SECONDS,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
-    """Load cached model quota snapshot and compute staleness."""
+    """Load cached model quota snapshot (with legacy fallback) and compute staleness."""
     current_ts = int(time.time()) if now_ts is None else int(now_ts)
     path = get_quota_cache_path()
+    if not path.exists() and not _has_quota_path_override():
+        legacy_path = path.parent / "context-guard-quota.json"
+        if legacy_path.is_file():
+            path = legacy_path
     default_payload: dict[str, Any] = {
         "available": False,
         "status": "idle",
@@ -1814,7 +2119,7 @@ def load_quota_cache(
     if raw_status not in ("ok", "unavailable", "error", "idle"):
         raw_status = "ok" if groups else "idle"
 
-    return {
+    payload = {
         "available": bool(groups) and raw.get("available", True) is not False,
         "status": raw_status,
         "source": str(raw.get("source") or "agy-cli"),
@@ -1826,6 +2131,58 @@ def load_quota_cache(
         "groups": groups,
         "error": str(raw.get("error") or "").strip(),
     }
+    return _attach_quota_predictions_safe(payload, now_ts=current_ts)
+
+
+def _import_lens_quota() -> Any | None:
+    """Lazily import lens_quota without failing if unavailable."""
+    try:
+        import lens_quota  # type: ignore[import-not-found]
+        return lens_quota
+    except ImportError:
+        try:
+            from . import lens_quota  # type: ignore[no-redef]
+            return lens_quota
+        except ImportError:
+            return None
+
+
+def _attach_quota_predictions_safe(
+    payload: dict[str, Any],
+    *,
+    now_ts: int,
+) -> dict[str, Any]:
+    """Attach burn-rate predictions via lens_quota, ignoring missing-module/IO errors."""
+    mod = _import_lens_quota()
+    if mod is None:
+        return payload
+    try:
+        return mod.attach_quota_predictions(payload, now_ts=now_ts)
+    except OSError:
+        return payload
+
+
+def _record_quota_sample_safe(
+    payload: dict[str, Any],
+    *,
+    now_ts: int,
+) -> None:
+    """Persist a quota history sample via lens_quota, ignoring missing-module/IO errors."""
+    mod = _import_lens_quota()
+    if mod is None:
+        return
+    try:
+        mod.record_quota_sample(payload, now_ts=now_ts)
+    except OSError:
+        pass
+
+
+def _save_quota_cache_safe(payload: dict[str, Any]) -> None:
+    """Persist quota cache under lock, ignoring filesystem errors."""
+    try:
+        save_json_locked(get_quota_cache_path(), payload)
+    except OSError:
+        pass
 
 
 def fetch_model_quota(
@@ -1845,10 +2202,7 @@ def fetch_model_quota(
             "fetching": False,
             "error": "agy CLI executable not found (install Antigravity CLI to track model quota).",
         }
-        try:
-            _save_json_atomic(get_quota_cache_path(), result)
-        except OSError:
-            pass
+        _save_quota_cache_safe(result)
         return result
 
     env = dict(os.environ)
@@ -1874,10 +2228,7 @@ def fetch_model_quota(
             "fetching": False,
             "error": err_msg,
         }
-        try:
-            _save_json_atomic(get_quota_cache_path(), result)
-        except OSError:
-            pass
+        _save_quota_cache_safe(result)
         return result
 
     raw_stdout = (proc.stdout or "")[:AGY_USAGE_MAX_BYTES].strip()
@@ -1894,10 +2245,7 @@ def fetch_model_quota(
             "fetching": False,
             "error": err_msg,
         }
-        try:
-            _save_json_atomic(get_quota_cache_path(), result)
-        except OSError:
-            pass
+        _save_quota_cache_safe(result)
         return result
 
     try:
@@ -1909,14 +2257,9 @@ def fetch_model_quota(
             "fetching": False,
             "error": str(exc),
         }
-        try:
-            _save_json_atomic(get_quota_cache_path(), result)
-        except OSError:
-            pass
+        _save_quota_cache_safe(result)
         return result
 
-    try:
-        _save_json_atomic(get_quota_cache_path(), parsed)
-    except OSError:
-        pass
-    return parsed
+    _save_quota_cache_safe(parsed)
+    _record_quota_sample_safe(parsed, now_ts=now_ts)
+    return _attach_quota_predictions_safe(parsed, now_ts=now_ts)

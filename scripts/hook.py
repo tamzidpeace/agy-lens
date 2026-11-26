@@ -19,9 +19,11 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import context_core as core
+import lens_guard
+import lens_quota
 
 BYPASS_PREFIXES: tuple[str, ...] = ("/compact", "/btw", "/rewind", "/new", "/clear")
-_SUPPORTED_EVENTS = frozenset({"SessionStart", "PreInvocation", "PostInvocation", "Stop"})
+_SUPPORTED_EVENTS = frozenset({"SessionStart", "PreInvocation", "PostInvocation", "PostToolUse", "Stop"})
 
 
 def is_bypass_command(last_user_input: str) -> bool:
@@ -84,12 +86,12 @@ def _build_warn_response(status: dict[str, Any]) -> dict[str, Any]:
     threshold = status["effectiveThresholdTokens"]
     pct = status["thresholdPercent"]
     single_line = (
-        f"[Context Guard] Context at {effective:,} / {threshold:,} tokens ({pct}%) "
-        "— approaching threshold. Consider /compact or the Context Guard side pane."
+        f"[Agy Lens] Context at {effective:,} / {threshold:,} tokens ({pct}%) "
+        "— approaching threshold. Consider /compact or the Agy Lens side pane."
     )
     markdown = (
-        f"**Context Guard Warning:** Context usage reached **{effective:,} / {threshold:,} tokens** "
-        f"({pct}%). Consider `/compact` or open the **Context Guard** side pane for bloat inspection and handoff."
+        f"**Agy Lens Warning:** Context usage reached **{effective:,} / {threshold:,} tokens** "
+        f"({pct}%). Consider `/compact` or open the **Agy Lens** side pane for bloat inspection and handoff."
     )
     return {"injectSteps": [_system_message_step(single_line, markdown)]}
 
@@ -100,17 +102,17 @@ def _build_limit_response(status: dict[str, Any], *, terminate: bool) -> dict[st
     threshold = status["effectiveThresholdTokens"]
     pct = status["thresholdPercent"]
     action_note = (
-        "Pausing turn — run /compact, snooze, or use Smart Handoff in the Context Guard side pane."
+        "Pausing turn — run /compact, snooze, or use Smart Handoff in the Agy Lens side pane."
         if terminate
-        else "Run /compact, snooze, or use Smart Handoff in the Context Guard side pane."
+        else "Run /compact, snooze, or use Smart Handoff in the Agy Lens side pane."
     )
     single_line = (
-        f"[Context Guard] Context limit reached ({effective:,} / {threshold:,} tokens, {pct}%). "
+        f"[Agy Lens] Context limit reached ({effective:,} / {threshold:,} tokens, {pct}%). "
         f"{action_note}"
     )
     markdown = (
-        f"**Context Guard Limit Reached:** Context usage is **{effective:,} / {threshold:,} tokens** "
-        f"({pct}%). Run `/compact`, snooze alerts, or start a **Smart Handoff** from the **Context Guard** side pane."
+        f"**Agy Lens Limit Reached:** Context usage is **{effective:,} / {threshold:,} tokens** "
+        f"({pct}%). Run `/compact`, snooze alerts, or start a **Smart Handoff** from the **Agy Lens** side pane."
     )
     response: dict[str, Any] = {"injectSteps": [_system_message_step(single_line, markdown)]}
     if terminate:
@@ -124,9 +126,9 @@ def _build_gate_block_response(status: dict[str, Any]) -> dict[str, Any]:
     threshold = status["effectiveThresholdTokens"]
     pct = status["thresholdPercent"]
     user_message = (
-        f"Context Guard (gate mode) paused this turn because context reached "
+        f"Agy Lens (gate mode) paused this turn because context reached "
         f"{effective:,} / {threshold:,} tokens ({pct}%). "
-        "Run /compact, /new, or open the Context Guard side pane to snooze or start a Smart Handoff."
+        "Run /compact, /new, or open the Agy Lens side pane to snooze or start a Smart Handoff."
     )
     return {
         "injectSteps": [_error_message_step(user_message)],
@@ -185,10 +187,14 @@ def _evaluate_invocation(
     event: str,
     status: dict[str, Any],
     conv_state: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Apply warn/stop/gate threshold rules with per-compaction-epoch deduplication."""
+) -> tuple[dict[str, Any], bool]:
+    """Apply warn/stop/gate threshold rules with per-compaction-epoch deduplication.
+
+    Returns ``(hook_response, crossed_limit_now)`` where ``crossed_limit_now``
+    is True only on the first limit crossing for the active compaction epoch.
+    """
     if status.get("status") in ("disabled", "no_data"):
-        return {}
+        return ({}, False)
 
     effective_tokens = status["effectiveTokens"]
     effective_threshold = status["effectiveThresholdTokens"]
@@ -201,25 +207,49 @@ def _evaluate_invocation(
 
     if effective_tokens >= effective_threshold:
         if event == "PreInvocation" and mode == "gate":
+            first_cross = alerted_epoch < compaction_count
             if conv_state is not None:
                 conv_state["warnedAtEpoch"] = max(warned_epoch, compaction_count)
                 conv_state["alertedAtEpoch"] = max(alerted_epoch, compaction_count)
-            return _build_gate_block_response(status)
+            return (_build_gate_block_response(status), first_cross)
 
         if alerted_epoch < compaction_count:
             if conv_state is not None:
                 conv_state["warnedAtEpoch"] = max(warned_epoch, compaction_count)
                 conv_state["alertedAtEpoch"] = compaction_count
             should_terminate = event == "PostInvocation" and mode in ("stop", "gate")
-            return _build_limit_response(status, terminate=should_terminate)
-        return {}
+            return (_build_limit_response(status, terminate=should_terminate), True)
+        return ({}, False)
 
     if effective_tokens >= warn_threshold and warned_epoch < compaction_count:
         if conv_state is not None:
             conv_state["warnedAtEpoch"] = compaction_count
-        return _build_warn_response(status)
+        return (_build_warn_response(status), False)
 
-    return {}
+    return ({}, False)
+
+
+def _merge_hook_responses(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    """Merge context threshold and loop-guard hook responses cleanly."""
+    if not primary:
+        return dict(secondary) if secondary else {}
+    if not secondary:
+        return dict(primary)
+
+    steps: list[Any] = []
+    if isinstance(primary.get("injectSteps"), list):
+        steps.extend(primary["injectSteps"])
+    if isinstance(secondary.get("injectSteps"), list):
+        steps.extend(secondary["injectSteps"])
+
+    merged: dict[str, Any] = {}
+    if steps:
+        merged["injectSteps"] = steps
+
+    term = primary.get("terminationBehavior") or secondary.get("terminationBehavior")
+    if isinstance(term, str) and term:
+        merged["terminationBehavior"] = term
+    return merged
 
 
 def handle_hook(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -262,6 +292,19 @@ def handle_hook(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
             core.save_config(config)
         return {}
 
+    if event == "PostToolUse":
+        conv_state = _sync_conversation_state(
+            config,
+            conv_id=conv_id,
+            explicit_transcript=explicit_transcript,
+            payload_model=payload_model,
+            status=None,
+        )
+        if conv_state is not None:
+            lens_guard.record_tool_use(conv_state, payload, config)
+            core.save_config(config)
+        return {}
+
     status = core.build_status_payload(
         conv_id=conv_id,
         explicit_path=explicit_transcript,
@@ -276,12 +319,72 @@ def handle_hook(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     response: dict[str, Any] = {}
+    alerts_cfg = config.get("alerts") if isinstance(config.get("alerts"), dict) else {}
+
     if event in ("PreInvocation", "PostInvocation"):
-        if status.get("enabled") and not is_bypass_command(last_user_input):
-            response = _evaluate_invocation(event, status, conv_state)
+        bypass = is_bypass_command(last_user_input)
+        if bypass and conv_state is not None:
+            conv_state["activeLoop"] = None
+            conv_state["loopHistory"] = []
+
+        ctx_resp: dict[str, Any] = {}
+        crossed_limit = False
+        if status.get("enabled") and not bypass:
+            ctx_resp, crossed_limit = _evaluate_invocation(event, status, conv_state)
+
+        loop_resp: dict[str, Any] = {}
+        newly_loop_alert = False
+        if conv_state is not None and not bypass:
+            loop_resp, newly_loop_alert = lens_guard.evaluate_loop_hook(
+                event, conv_state, payload, config
+            )
+
+        response = _merge_hook_responses(ctx_resp, loop_resp)
+
+        if crossed_limit and alerts_cfg.get("notifyOnThreshold", True):
+            lens_guard.maybe_send_alert(
+                "threshold",
+                "Agy Lens: Context Limit",
+                f"Context reached {status['effectiveTokens']:,} / {status['effectiveThresholdTokens']:,} tokens ({status['thresholdPercent']}%).",
+                config,
+            )
+        if newly_loop_alert and alerts_cfg.get("notifyOnLoop", True):
+            active_loop = conv_state.get("activeLoop") if conv_state is not None else None
+            tool_name = active_loop.get("toolName", "tool") if isinstance(active_loop, dict) else "tool"
+            count = active_loop.get("count", 0) if isinstance(active_loop, dict) else 0
+            lens_guard.maybe_send_alert(
+                "loop",
+                "Agy Lens: Loop Guard",
+                f"Detected {count} consecutive repeats/failures on {tool_name}.",
+                config,
+            )
+
+    elif event == "Stop":
+        term_reason = str(payload.get("terminationReason") or "").strip().upper()
+        fully_idle = payload.get("fullyIdle", True) is not False
+        exec_num = core._safe_int(payload.get("executionNum"), 1)
+        should_notify_stop = alerts_cfg.get("notifyOnStop", True) and (
+            term_reason == "ERROR"
+            or (fully_idle and exec_num >= 1 and term_reason != "USER_CANCELED")
+        )
+        if should_notify_stop:
+            alert_msg = (
+                core._sanitize_snippet(str(payload.get("error") or "Run stopped with error."), 140)
+                if term_reason == "ERROR"
+                else "Agent turn finished."
+            )
+            alert_kind = "error" if term_reason == "ERROR" else "stop"
+            lens_guard.maybe_send_alert(alert_kind, "Agy Lens", alert_msg, config)
 
     if conv_state is not None:
         core.save_config(config)
+
+    if event == "Stop":
+        try:
+            lens_quota.maybe_spawn_background_quota_refresh(min_interval_seconds=300)
+        except Exception:
+            pass
+
     return response
 
 

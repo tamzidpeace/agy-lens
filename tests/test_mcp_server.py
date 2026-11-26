@@ -67,9 +67,10 @@ def _user_step(step_index: int, content: str) -> dict[str, object]:
 
 def _env_for(tmp: str, cfg_path: Path | None = None, root: Path | None = None) -> dict[str, str]:
     return {
-        "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path or (Path(tmp) / "config" / "context-guard.json")),
+        "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path or (Path(tmp) / "config" / "agy-lens.json")),
         "CONTEXT_GUARD_BRAIN_ROOTS": str(root or (Path(tmp) / "brain-root")),
         "CONTEXT_GUARD_DISABLE_AUTO_QUOTA": "1",
+        "AGY_LENS_DISABLE_SYSTEM_ALERTS": "1",
     }
 
 
@@ -126,7 +127,7 @@ class TestMcpServer(unittest.TestCase):
             self.assertIn("resources", init_res["capabilities"])
             self.assertEqual(
                 init_res["serverInfo"],
-                {"name": "agy-context-guard-monitor", "version": "1.0.0"},
+                {"name": "agy-lens-monitor", "version": "2.0.0-beta.1"},
             )
 
             ping_resp = responses[1]
@@ -160,11 +161,17 @@ class TestMcpServer(unittest.TestCase):
             "context_overview",
             "context_configure",
             "context_handoff",
+            "lens_search",
+            "lens_footprint",
             "app_save_settings",
             "app_snooze",
             "app_refresh",
             "app_build_handoff",
             "app_quota",
+            "app_search",
+            "app_footprint",
+            "app_clear_loop",
+            "app_test_alert",
         }
         self.assertEqual(set(by_name.keys()), expected_names)
 
@@ -176,7 +183,7 @@ class TestMcpServer(unittest.TestCase):
         )
         self.assertEqual(
             status_tool["_meta"]["com.google.antigravity/ui"]["entrypoints"],
-            [{"type": "aux_pane", "title": "Context Guard"}],
+            [{"type": "aux_pane", "title": "Agy Lens"}],
         )
 
         overview_tool = by_name["context_overview"]
@@ -187,10 +194,10 @@ class TestMcpServer(unittest.TestCase):
         )
         self.assertEqual(
             overview_tool["_meta"]["com.google.antigravity/ui"]["entrypoints"],
-            [{"type": "global", "title": "Context Guard"}],
+            [{"type": "global", "title": "Agy Lens"}],
         )
 
-        for model_app_tool in ("context_configure", "context_handoff"):
+        for model_app_tool in ("context_configure", "context_handoff", "lens_search", "lens_footprint"):
             self.assertEqual(
                 by_name[model_app_tool]["_meta"]["ui"]["visibility"],
                 ["model", "app"],
@@ -202,6 +209,10 @@ class TestMcpServer(unittest.TestCase):
             "app_refresh",
             "app_build_handoff",
             "app_quota",
+            "app_search",
+            "app_footprint",
+            "app_clear_loop",
+            "app_test_alert",
         ):
             self.assertEqual(by_name[app_only_tool]["_meta"]["ui"]["visibility"], ["app"])
 
@@ -620,6 +631,88 @@ class TestMcpServer(unittest.TestCase):
                     with mcp_server._QUOTA_LOCK:
                         mcp_server._QUOTA_FETCHING = False
                     self.assertTrue(worker_mock.called or True)
+
+    def test_lens_search_footprint_loop_clear_test_alert_and_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "antigravity"
+            ws = Path(tmp) / "workspace"
+            (ws / ".git").mkdir(parents=True, exist_ok=True)
+            (ws / "GEMINI.md").write_text("Follow strict TypeScript types.\n", encoding="utf-8")
+            tx = root / "brain" / "conv-lens" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tx,
+                [
+                    _user_step(0, "Debug oauth pkce token exchange"),
+                    _planner_step(1, input_tokens=18_500, output_tokens=500),
+                ],
+            )
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            cfg_path = fake_home / ".gemini" / "config" / "agy-lens.json"
+            search_cache = fake_home / ".gemini" / "config" / "agy-lens-search-cache.json"
+            env = {
+                **_env_for(tmp, cfg_path, root),
+                "HOME": str(fake_home),
+                "AGY_LENS_SEARCH_CACHE_PATH": str(search_cache),
+                "AGY_LENS_WORKSPACE": str(ws),
+            }
+
+            with mock.patch.dict(os.environ, env, clear=False):
+                # Save loopGuard and alerts settings via app_save_settings
+                save_res = mcp_server.call_tool(
+                    "app_save_settings",
+                    {
+                        "conversationId": "conv-lens",
+                        "loopGuard": {"enabled": True, "consecutiveThreshold": 4, "autoPauseThreshold": 6},
+                        "alerts": {"soundEnabled": False, "notifyOnLowQuotaPct": 20},
+                    },
+                )
+                self.assertNotIn("isError", save_res)
+                sc_save = save_res["structuredContent"]
+                self.assertEqual(sc_save["loopGuard"]["consecutiveThreshold"], 4)
+                self.assertEqual(sc_save["loopGuard"]["autoPauseThreshold"], 6)
+                self.assertFalse(sc_save["alerts"]["soundEnabled"])
+                self.assertEqual(sc_save["alerts"]["notifyOnLowQuotaPct"], 20)
+
+                # Seed an activeLoop and confirm status surfaces it + app_clear_loop clears it
+                cfg = core.load_config()
+                st = core.get_conversation_state(cfg, "conv-lens")
+                st["activeLoop"] = {
+                    "signature": "cmd:npm test",
+                    "toolName": "run_command",
+                    "count": 4,
+                    "reason": "consecutive_failures",
+                    "lastErrorSnippet": "exit status 1",
+                }
+                core.save_config(cfg)
+
+                status_res = mcp_server.call_tool("context_status", {"conversationId": "conv-lens"})
+                self.assertNotIn("isError", status_res)
+                self.assertEqual(status_res["structuredContent"]["activeLoop"]["count"], 4)
+
+                clear_res = mcp_server.call_tool("app_clear_loop", {"conversationId": "conv-lens"})
+                self.assertNotIn("isError", clear_res)
+                self.assertIsNone(clear_res["structuredContent"]["activeLoop"])
+
+                # Cross-chat search via model tool & app tool
+                search_res = mcp_server.call_tool("lens_search", {"query": "pkce"})
+                self.assertNotIn("isError", search_res)
+                self.assertEqual(search_res["structuredContent"]["view"], "search")
+                self.assertEqual(search_res["structuredContent"]["matchedCount"], 1)
+                self.assertEqual(search_res["structuredContent"]["results"][0]["convId"], "conv-lens")
+
+                # Setup footprint via app tool (verifying observedStartupTokens wired from active chat)
+                fp_res = mcp_server.call_tool("app_footprint", {"conversationId": "conv-lens"})
+                self.assertNotIn("isError", fp_res)
+                sc_fp = fp_res["structuredContent"]
+                self.assertEqual(sc_fp["view"], "footprint")
+                self.assertEqual(sc_fp["summary"]["rulesCount"], 1)
+                self.assertEqual(sc_fp["summary"]["observedStartupTokens"], 19_000)
+
+                # Test alert respects AGY_LENS_DISABLE_SYSTEM_ALERTS=1 safely
+                alert_res = mcp_server.call_tool("app_test_alert", {})
+                self.assertNotIn("isError", alert_res)
+                self.assertEqual(alert_res["structuredContent"]["reason"], "disabled_by_env")
 
 
 if __name__ == "__main__":

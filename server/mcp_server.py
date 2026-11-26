@@ -23,13 +23,16 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import context_core
+import lens_footprint
+import lens_guard
+import lens_search
 
 APP_URI = "ui://context-guard/dashboard.html"
 RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO: dict[str, str] = {
-    "name": "agy-context-guard-monitor",
-    "version": "1.0.0",
+    "name": "agy-lens-monitor",
+    "version": "2.0.0-beta.1",
 }
 DEFAULT_SNOOZE_DELTA_TOKENS = 50_000
 DEFAULT_OVERVIEW_LIMIT = 20
@@ -39,9 +42,9 @@ DEFAULT_APP_HTML_PATH = Path(__file__).resolve().parent.parent / "ui" / "app.htm
 _FALLBACK_HTML = (
     "<!doctype html>"
     "<html lang=\"en\">"
-    "<head><meta charset=\"utf-8\"><title>Context Guard</title></head>"
+    "<head><meta charset=\"utf-8\"><title>Agy Lens</title></head>"
     "<body>"
-    "<h1>Context Guard Dashboard</h1>"
+    "<h1>Agy Lens Dashboard</h1>"
     "<p>Dashboard UI bundle (ui/app.html) has not been built yet.</p>"
     "</body>"
     "</html>"
@@ -72,7 +75,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "visibility": ["model", "app"],
             },
             "com.google.antigravity/ui": {
-                "entrypoints": [{"type": "aux_pane", "title": "Context Guard"}],
+                "entrypoints": [{"type": "aux_pane", "title": "Agy Lens"}],
             },
         },
     },
@@ -100,7 +103,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "visibility": ["model", "app"],
             },
             "com.google.antigravity/ui": {
-                "entrypoints": [{"type": "global", "title": "Context Guard"}],
+                "entrypoints": [{"type": "global", "title": "Agy Lens"}],
             },
         },
     },
@@ -157,6 +160,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Clear any active snooze on the target conversation.",
                 },
+                "loopGuard": {
+                    "type": "object",
+                    "description": "Stuck-loop detector settings patch (enabled, consecutiveThreshold, nudgeOncePerStreak, autoPauseThreshold).",
+                },
+                "alerts": {
+                    "type": "object",
+                    "description": "Smart sound & desktop notification settings patch.",
+                },
             },
             "required": [],
         },
@@ -193,8 +204,52 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "lens_search",
+        "description": (
+            "Full-text search across all past Antigravity conversation transcripts, "
+            "artifacts, and edited file paths."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search terms or quoted phrases (empty lists recent chats)."},
+                "scope": {"type": "string", "enum": ["all", "messages", "artifacts", "files"]},
+                "includeSubagents": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": APP_URI,
+                "visibility": ["model", "app"],
+            },
+        },
+    },
+    {
+        "name": "lens_footprint",
+        "description": (
+            "Inspect startup context token footprint across global and workspace rules, "
+            "plugins, skills, MCP servers, and hooks."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspacePath": {"type": "string", "description": "Optional workspace root directory to inspect."},
+                "conversationId": {"type": "string", "description": "Optional conversation ID to compare observed startup tokens."},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": APP_URI,
+                "visibility": ["model", "app"],
+            },
+        },
+    },
+    {
         "name": "app_save_settings",
-        "description": "Persist Context Guard settings from the MCP App UI and return refreshed status.",
+        "description": "Persist Agy Lens settings from the MCP App UI and return refreshed status.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -210,6 +265,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "conversationId": {"type": "string"},
                 "customThresholdTokens": {"type": "integer", "minimum": 0},
                 "resetSnooze": {"type": "boolean"},
+                "loopGuard": {"type": "object"},
+                "alerts": {"type": "object"},
             },
             "required": [],
         },
@@ -281,6 +338,72 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "refresh": {"type": "boolean"},
             },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            },
+        },
+    },
+    {
+        "name": "app_search",
+        "description": "Cross-chat full-text search for the MCP App UI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "scope": {"type": "string", "enum": ["all", "messages", "artifacts", "files"]},
+                "includeSubagents": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            },
+        },
+    },
+    {
+        "name": "app_footprint",
+        "description": "Inspect startup customizations token footprint for the MCP App UI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspacePath": {"type": "string"},
+                "conversationId": {"type": "string"},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            },
+        },
+    },
+    {
+        "name": "app_clear_loop",
+        "description": "Dismiss active Loop Guard alert and reset loop streak for a conversation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversationId": {"type": "string"},
+            },
+            "required": [],
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            },
+        },
+    },
+    {
+        "name": "app_test_alert",
+        "description": "Trigger a one-shot test sound and desktop notification from the UI Settings drawer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
             "required": [],
         },
         "_meta": {
@@ -389,6 +512,49 @@ def _optional_bool(arguments: dict[str, Any], key: str) -> bool | None:
     return val
 
 
+def _optional_dict(arguments: dict[str, Any], key: str) -> dict[str, Any] | None:
+    """Extract an optional object argument, raising ValueError on non-dict values."""
+    if key not in arguments or arguments[key] is None:
+        return None
+    val = arguments[key]
+    if not isinstance(val, dict):
+        raise ValueError(f"'{key}' must be an object")
+    return val
+
+
+def _attach_lens_state(
+    payload: dict[str, Any],
+    config: dict[str, Any],
+    conv_id: str | None,
+) -> dict[str, Any]:
+    """Attach activeLoop, loopGuard, and public alerts settings to a status payload."""
+    target_id = conv_id or payload.get("conversationId")
+    convs = config.get("conversations")
+    conv_state = (
+        convs.get(target_id)
+        if isinstance(target_id, str) and isinstance(convs, dict)
+        else None
+    )
+    active_loop = conv_state.get("activeLoop") if isinstance(conv_state, dict) else None
+    payload["activeLoop"] = copy.deepcopy(active_loop) if isinstance(active_loop, dict) else None
+
+    lg = config.get("loopGuard")
+    payload["loopGuard"] = copy.deepcopy(lg) if isinstance(lg, dict) else dict(context_core.DEFAULT_LOOP_GUARD)
+
+    raw_alerts = config.get("alerts")
+    alerts_src = raw_alerts if isinstance(raw_alerts, dict) else context_core.DEFAULT_ALERTS
+    payload["alerts"] = {
+        "soundEnabled": bool(alerts_src.get("soundEnabled", True)),
+        "desktopNotificationEnabled": bool(alerts_src.get("desktopNotificationEnabled", True)),
+        "notifyOnStop": bool(alerts_src.get("notifyOnStop", True)),
+        "notifyOnThreshold": bool(alerts_src.get("notifyOnThreshold", True)),
+        "notifyOnLoop": bool(alerts_src.get("notifyOnLoop", True)),
+        "notifyOnLowQuotaPct": context_core._safe_int(alerts_src.get("notifyOnLowQuotaPct"), 15),
+        "cooldownSeconds": context_core._safe_int(alerts_src.get("cooldownSeconds"), 15),
+    }
+    return payload
+
+
 def _tool_result(text: str, structured: dict[str, Any]) -> dict[str, Any]:
     """Build standard MCP tool response with concise text and structuredContent."""
     return {
@@ -492,6 +658,7 @@ def _handle_status(arguments: dict[str, Any], request_meta: dict[str, Any]) -> d
     config = context_core.load_config()
     conv_id = resolve_conversation_id(arguments, request_meta, config)
     payload = context_core.build_status_payload(conv_id=conv_id, config=config)
+    _attach_lens_state(payload, config, conv_id)
     payload["modelQuota"] = get_quota_snapshot(trigger_if_stale=True)
     return _tool_result(_format_status_summary(payload), payload)
 
@@ -527,6 +694,8 @@ def _handle_configure(arguments: dict[str, Any], request_meta: dict[str, Any]) -
         snooze_delta = _optional_int(arguments, "deltaTokens", min_value=0)
     snooze_until = _optional_int(arguments, "snoozeUntilTokens", min_value=0)
     reset_snooze = _optional_bool(arguments, "resetSnooze")
+    loop_guard_patch = _optional_dict(arguments, "loopGuard")
+    alerts_patch = _optional_dict(arguments, "alerts")
 
     config = context_core.load_config()
     conv_id = resolve_conversation_id(arguments, request_meta, config)
@@ -542,10 +711,13 @@ def _handle_configure(arguments: dict[str, Any], request_meta: dict[str, Any]) -
         snooze_delta=snooze_delta,
         snooze_until_tokens=snooze_until,
         reset_snooze=bool(reset_snooze),
+        loop_guard_patch=loop_guard_patch,
+        alerts_patch=alerts_patch,
     )
     status = context_core.build_status_payload(conv_id=conv_id, config=updated_config)
+    _attach_lens_state(status, updated_config, conv_id)
     summary = (
-        f"Context Guard settings saved: enabled={status['enabled']}, "
+        f"Agy Lens settings saved: enabled={status['enabled']}, "
         f"mode={status['mode']}, effectiveThreshold={status['effectiveThresholdTokens']:,}, "
         f"warnPercent={status['warnPercent']}%, autoRefresh={status['autoRefreshSeconds']}s, "
         f"snoozedUntil={status['snoozedUntilTokens']:,}."
@@ -575,6 +747,7 @@ def _handle_snooze(arguments: dict[str, Any], request_meta: dict[str, Any]) -> d
         reset_snooze=bool(reset_snooze),
     )
     status = context_core.build_status_payload(conv_id=conv_id, config=updated_config)
+    _attach_lens_state(status, updated_config, conv_id)
     target_label = status.get("conversationId") or conv_id or "active"
     if reset_snooze and delta_tokens is None and snooze_until is None:
         summary = (
@@ -626,16 +799,115 @@ def _handle_quota(arguments: dict[str, Any], _request_meta: dict[str, Any]) -> d
     return _tool_result(summary, {"view": "quota", "modelQuota": snapshot})
 
 
+def _handle_search(arguments: dict[str, Any], _request_meta: dict[str, Any]) -> dict[str, Any]:
+    """Handle lens_search and app_search tool calls."""
+    query = _optional_str(arguments, "query") or ""
+    scope = _optional_str(arguments, "scope") or "all"
+    if scope not in ("all", "messages", "artifacts", "files"):
+        raise ValueError(f"Invalid scope {scope!r}; expected 'all', 'messages', 'artifacts', or 'files'")
+    include_subagents = bool(_optional_bool(arguments, "includeSubagents"))
+    limit = _optional_int(arguments, "limit", min_value=1, max_value=50)
+    config = context_core.load_config()
+    result = lens_search.search_conversations(
+        query,
+        include_subagents=include_subagents,
+        scope=scope,
+        limit=limit if limit is not None else 25,
+        config=config,
+    )
+    payload = {"view": "search", **result}
+    q_label = f" for '{query}'" if query.strip() else " (recent)"
+    summary = f"Agy Lens Search{q_label}: {result['matchedCount']} match(es) across {result['totalIndexed']} indexed chat(s)."
+    return _tool_result(summary, payload)
+
+
+def _infer_observed_startup_tokens(
+    conv_id: str | None,
+    config: dict[str, Any],
+) -> int | None:
+    """Return token count of the active conversation's earliest planner turn if available."""
+    if not conv_id:
+        return None
+    status = context_core.build_status_payload(conv_id=conv_id, config=config)
+    first_turn = status.get("firstTurnTokens")
+    if isinstance(first_turn, int) and first_turn > 0:
+        return first_turn
+    history = status.get("history")
+    if isinstance(history, list) and history:
+        first = history[0]
+        if isinstance(first, dict):
+            total = first.get("totalTokens")
+            if isinstance(total, int) and total > 0:
+                return total
+    return None
+
+
+def _handle_footprint(arguments: dict[str, Any], request_meta: dict[str, Any]) -> dict[str, Any]:
+    """Handle lens_footprint and app_footprint tool calls."""
+    workspace_path = _optional_str(arguments, "workspacePath")
+    _optional_str(arguments, "conversationId")
+    config = context_core.load_config()
+    conv_id = resolve_conversation_id(arguments, request_meta, config)
+    observed = _infer_observed_startup_tokens(conv_id, config)
+    result = lens_footprint.inspect_footprint(
+        workspace_path=workspace_path,
+        config=config,
+        observed_startup_tokens=observed,
+    )
+    payload = {"view": "footprint", **result}
+    sm = result["summary"]
+    summary = (
+        f"Agy Lens Footprint ({result['workspacePath']}): "
+        f"~{sm['estimatedStartupTokens']:,} est. startup tokens "
+        f"({sm['rulesCount']} rules, {sm['skillsCount']} custom skills, {sm['mcpServersCount']} MCP servers)."
+    )
+    return _tool_result(summary, payload)
+
+
+def _handle_clear_loop(arguments: dict[str, Any], request_meta: dict[str, Any]) -> dict[str, Any]:
+    """Handle app_clear_loop tool calls."""
+    _optional_str(arguments, "conversationId")
+    config = context_core.load_config()
+    conv_id = resolve_conversation_id(arguments, request_meta, config)
+    lens_guard.clear_active_loop(conv_id)
+    updated_config = context_core.load_config()
+    status = context_core.build_status_payload(conv_id=conv_id, config=updated_config)
+    _attach_lens_state(status, updated_config, conv_id)
+    return _tool_result(f"Agy Lens Loop Guard dismissed for {conv_id or 'active'}.", status)
+
+
+def _handle_test_alert(_arguments: dict[str, Any], _request_meta: dict[str, Any]) -> dict[str, Any]:
+    """Handle app_test_alert tool calls from the UI Settings drawer."""
+    config = context_core.load_config()
+    res = lens_guard.maybe_send_alert(
+        "test",
+        "Agy Lens Test Alert",
+        "Smart sound & desktop notifications are active.",
+        config,
+        force=True,
+    )
+    return _tool_result(
+        f"Test alert result: sent={res.get('sent')} ({res.get('reason', 'ok')}).",
+        {"view": "alert_test", **res},
+    )
+
+
 _TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
     "context_status": _handle_status,
     "context_overview": _handle_overview,
     "context_configure": _handle_configure,
     "context_handoff": _handle_handoff,
+    "lens_search": _handle_search,
+    "lens_footprint": _handle_footprint,
     "app_save_settings": _handle_configure,
     "app_snooze": _handle_snooze,
     "app_refresh": _handle_refresh,
     "app_build_handoff": _handle_handoff,
     "app_quota": _handle_quota,
+    "app_search": _handle_search,
+    "app_footprint": _handle_footprint,
+    "app_clear_loop": _handle_clear_loop,
+    "app_test_alert": _handle_test_alert,
 }
 
 
@@ -757,7 +1029,7 @@ def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
                 "resources": [
                     {
                         "uri": APP_URI,
-                        "name": "Context Guard Dashboard",
+                        "name": "Agy Lens Dashboard",
                         "mimeType": RESOURCE_MIME_TYPE,
                         "_meta": copy.deepcopy(_META_RESOURCE_UI),
                     }

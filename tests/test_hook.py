@@ -49,6 +49,8 @@ def _env_for(tmp: str, cfg_path: Path | None = None, root: Path | None = None) -
     return {
         "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path or (Path(tmp) / "config" / "context-guard.json")),
         "CONTEXT_GUARD_BRAIN_ROOTS": str(root or (Path(tmp) / "brain-root")),
+        "AGY_LENS_DISABLE_SYSTEM_ALERTS": "1",
+        "CONTEXT_GUARD_DISABLE_AUTO_QUOTA": "1",
     }
 
 
@@ -347,6 +349,77 @@ class TestHooks(unittest.TestCase):
                     },
                 )
                 self.assertEqual(disabled_res, {})
+
+    def test_post_tool_use_loop_nudge_bypass_recovery_and_stop_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config" / "agy-lens.json"
+            root = Path(tmp) / "antigravity"
+            transcript = root / "brain" / "conv-loop" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(transcript, [_planner_step(0, input_tokens=20_000)])
+
+            with mock.patch.dict(os.environ, _env_for(tmp, cfg_path, root), clear=False):
+                tool_fail = {
+                    "conversationId": "conv-loop",
+                    "transcriptPath": str(transcript),
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "npm test"}},
+                    "error": "exit status 1",
+                    "stepIdx": 1,
+                }
+                for _ in range(3):
+                    res = hook.handle_hook("PostToolUse", tool_fail)
+                    self.assertEqual(res, {})
+
+                pre_res = hook.handle_hook(
+                    "PreInvocation",
+                    {
+                        "conversationId": "conv-loop",
+                        "transcriptPath": str(transcript),
+                        "lastUserInput": "Run tests",
+                    },
+                )
+                self.assertIn("injectSteps", pre_res)
+                self.assertIn("Loop Guard", pre_res["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+                # Bypass command clears activeLoop cleanly
+                bypass_res = hook.handle_hook(
+                    "PreInvocation",
+                    {
+                        "conversationId": "conv-loop",
+                        "transcriptPath": str(transcript),
+                        "lastUserInput": "/compact",
+                    },
+                )
+                self.assertEqual(bypass_res, {})
+                self.assertIsNone(core.load_config()["conversations"]["conv-loop"]["activeLoop"])
+
+            with mock.patch.dict(os.environ, _env_for(tmp, cfg_path, root), clear=False):
+                with mock.patch("hook.lens_guard.maybe_send_alert") as alert_mock, mock.patch(
+                    "hook.lens_quota.maybe_spawn_background_quota_refresh"
+                ) as quota_mock:
+                    hook.handle_hook(
+                        "Stop",
+                        {
+                            "conversationId": "conv-loop",
+                            "transcriptPath": str(transcript),
+                            "terminationReason": "USER_CANCELED",
+                            "fullyIdle": True,
+                            "executionNum": 2,
+                        },
+                    )
+                    alert_mock.assert_not_called()
+                    quota_mock.assert_called_once()
+
+                    hook.handle_hook(
+                        "Stop",
+                        {
+                            "conversationId": "conv-loop",
+                            "transcriptPath": str(transcript),
+                            "terminationReason": "NO_TOOL_CALL",
+                            "fullyIdle": True,
+                            "executionNum": 2,
+                        },
+                    )
+                    alert_mock.assert_called_once()
 
 
 if __name__ == "__main__":

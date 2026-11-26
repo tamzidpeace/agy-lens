@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -398,6 +400,8 @@ class TestTranscriptAnalysis(unittest.TestCase):
             self.assertEqual(immediately_after["compactions"][0]["newPromptTokens"], 0)
             self.assertEqual(immediately_after["totalTokens"], 0)
             self.assertEqual(immediately_after["activeEpochStep"], 3)
+            self.assertEqual(immediately_after["firstTurnTokens"], 367_489)
+            self.assertEqual(immediately_after["history"], [])
             self.assertLess(immediately_after["effectiveTokens"], 2_000)
             self.assertEqual(immediately_after["effectiveTokens"], immediately_after["pendingDeltaTokens"])
 
@@ -419,6 +423,8 @@ class TestTranscriptAnalysis(unittest.TestCase):
             self.assertEqual(after_turn["compactionCount"], 1)
             self.assertEqual(after_turn["compactions"][0]["newPromptTokens"], 30_622)
             self.assertEqual(after_turn["effectiveTokens"], 31_434)
+            self.assertEqual(after_turn["firstTurnTokens"], 367_489)
+            self.assertEqual([h["stepIndex"] for h in after_turn["history"]], [4])
 
     def test_prose_context_summary_mentions_not_counted_as_compactions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -947,6 +953,223 @@ class TestModelQuota(unittest.TestCase):
                 cached = core.load_quota_cache(ttl_seconds=300, now_ts=fetched["fetchedAt"] + 10)
                 self.assertFalse(cached["stale"])
                 self.assertEqual(cached["groups"][0]["buckets"][0]["remainingPercent"], 51.0)
+
+
+class TestAgyLensMigrationAndLocking(unittest.TestCase):
+    def test_migrates_legacy_context_guard_config_to_agy_lens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            cfg_dir = fake_home / ".gemini" / "config"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+
+            legacy_cfg_path = cfg_dir / "context-guard.json"
+            legacy_cfg_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "thresholdTokens": 250_000,
+                        "warnPercent": 75,
+                        "mode": "gate",
+                        "autoRefreshSeconds": 10,
+                        "lastActiveConversationId": "legacy-conv",
+                        "conversations": {
+                            "legacy-conv": {
+                                "lastTokens": 120_000,
+                                "customThresholdTokens": 200_000,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            legacy_quota_path = cfg_dir / "context-guard-quota.json"
+            legacy_quota_path.write_text(
+                json.dumps(
+                    {
+                        "available": True,
+                        "status": "ok",
+                        "source": "agy-cli",
+                        "fetchedAt": 1_700_000_000,
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-5h",
+                                        "label": "5h limit",
+                                        "remainingPercent": 72.0,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            clean_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k
+                not in {
+                    "AGY_LENS_CONFIG_PATH",
+                    "CONTEXT_GUARD_CONFIG_PATH",
+                    "AGY_LENS_QUOTA_PATH",
+                    "CONTEXT_GUARD_QUOTA_PATH",
+                }
+            }
+            clean_env["HOME"] = str(fake_home)
+
+            with mock.patch.dict(os.environ, clean_env, clear=True):
+                expected_cfg_path = cfg_dir / "agy-lens.json"
+                expected_quota_path = cfg_dir / "agy-lens-quota.json"
+                self.assertEqual(core.get_config_path(), expected_cfg_path)
+                self.assertEqual(core.get_quota_cache_path(), expected_quota_path)
+
+                cfg = core.load_config()
+                self.assertEqual(cfg["thresholdTokens"], 250_000)
+                self.assertEqual(cfg["warnPercent"], 75)
+                self.assertEqual(cfg["mode"], "gate")
+                self.assertEqual(cfg["autoRefreshSeconds"], 10)
+                self.assertEqual(cfg["lastActiveConversationId"], "legacy-conv")
+                self.assertEqual(cfg["conversations"]["legacy-conv"]["lastTokens"], 120_000)
+                self.assertEqual(cfg["conversations"]["legacy-conv"]["customThresholdTokens"], 200_000)
+                self.assertEqual(cfg["loopGuard"], core.DEFAULT_LOOP_GUARD)
+                self.assertEqual(cfg["alerts"], core.DEFAULT_ALERTS)
+
+                quota = core.load_quota_cache(ttl_seconds=300, now_ts=1_700_000_050)
+                self.assertTrue(quota["available"])
+                self.assertFalse(quota["stale"])
+                self.assertEqual(quota["groups"][0]["buckets"][0]["remainingPercent"], 72.0)
+
+                saved_path = core.save_config(cfg)
+                self.assertEqual(saved_path, expected_cfg_path)
+                self.assertTrue(expected_cfg_path.is_file())
+                reloaded = json.loads(expected_cfg_path.read_text(encoding="utf-8"))
+                self.assertEqual(reloaded["thresholdTokens"], 250_000)
+                self.assertEqual(reloaded["loopGuard"], core.DEFAULT_LOOP_GUARD)
+                self.assertEqual(reloaded["alerts"], core.DEFAULT_ALERTS)
+
+    def test_update_json_locked_serializes_concurrent_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "shared-state.json"
+            errors: list[BaseException] = []
+
+            def worker() -> None:
+                try:
+                    for _ in range(10):
+                        def _inc(cur: dict[str, object]) -> dict[str, object]:
+                            count = int(cur.get("count", 0))  # type: ignore[arg-type]
+                            time.sleep(0.002)
+                            return {"count": count + 1}
+
+                        core.update_json_locked(target, _inc, default={"count": 0})
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+
+            self.assertEqual(errors, [])
+            final_data = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(final_data["count"], 20)
+
+    def test_update_settings_clamps_loop_guard_and_alerts_and_preserves_loop_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "agy-lens.json"
+            empty_root = Path(tmp) / "empty-root"
+            env = {
+                "AGY_LENS_CONFIG_PATH": str(cfg_path),
+                "CONTEXT_GUARD_BRAIN_ROOTS": str(empty_root),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                cfg = core.load_config()
+                conv = core.get_conversation_state(cfg, "conv-loop")
+                conv["activeLoop"] = {
+                    "signature": "read_file:/tmp/a.py",
+                    "toolName": "read_file",
+                    "streak": 3,
+                    "nudged": True,
+                }
+                conv["loopHistory"] = [
+                    {"signature": f"cmd:{i}", "streak": 3 + (i % 2)}
+                    for i in range(12)
+                ]
+                core.save_config(cfg)
+
+                updated = core.update_settings(
+                    cfg,
+                    loop_guard_patch={
+                        "enabled": False,
+                        "consecutiveThreshold": 1,
+                        "nudgeOncePerStreak": False,
+                        "autoPauseThreshold": 2,
+                    },
+                    alerts_patch={
+                        "soundEnabled": False,
+                        "desktopNotificationEnabled": True,
+                        "notifyOnStop": False,
+                        "notifyOnThreshold": False,
+                        "notifyOnLoop": True,
+                        "notifyOnLowQuotaPct": -5,
+                        "cooldownSeconds": -10,
+                    },
+                )
+                self.assertEqual(updated["loopGuard"]["enabled"], False)
+                self.assertEqual(updated["loopGuard"]["consecutiveThreshold"], 2)
+                self.assertEqual(updated["loopGuard"]["nudgeOncePerStreak"], False)
+                self.assertEqual(updated["loopGuard"]["autoPauseThreshold"], 4)
+                self.assertEqual(updated["alerts"]["soundEnabled"], False)
+                self.assertEqual(updated["alerts"]["notifyOnStop"], False)
+                self.assertEqual(updated["alerts"]["notifyOnLowQuotaPct"], 0)
+                self.assertEqual(updated["alerts"]["cooldownSeconds"], 0)
+
+                updated2 = core.update_settings(
+                    updated,
+                    loop_guard_patch={
+                        "consecutiveThreshold": 99,
+                        "autoPauseThreshold": 99,
+                    },
+                    alerts_patch={
+                        "notifyOnLowQuotaPct": 99,
+                        "cooldownSeconds": 999,
+                    },
+                )
+                self.assertEqual(updated2["loopGuard"]["consecutiveThreshold"], 6)
+                self.assertEqual(updated2["loopGuard"]["autoPauseThreshold"], 10)
+                self.assertEqual(updated2["alerts"]["notifyOnLowQuotaPct"], 50)
+                self.assertEqual(updated2["alerts"]["cooldownSeconds"], 300)
+
+                # 0 disables auto-pause
+                updated3 = core.update_settings(
+                    updated2,
+                    loop_guard_patch={"autoPauseThreshold": 0},
+                )
+                self.assertEqual(updated3["loopGuard"]["autoPauseThreshold"], 0)
+
+                reloaded = core.load_config()
+                self.assertEqual(reloaded["loopGuard"]["autoPauseThreshold"], 0)
+                self.assertEqual(reloaded["loopGuard"]["consecutiveThreshold"], 6)
+                self.assertEqual(reloaded["alerts"]["notifyOnLowQuotaPct"], 50)
+                self.assertEqual(reloaded["alerts"]["cooldownSeconds"], 300)
+                reloaded_conv = reloaded["conversations"]["conv-loop"]
+                self.assertEqual(
+                    reloaded_conv["activeLoop"],
+                    {
+                        "signature": "read_file:/tmp/a.py",
+                        "toolName": "read_file",
+                        "streak": 3,
+                        "nudged": True,
+                    },
+                )
+                self.assertEqual(len(reloaded_conv["loopHistory"]), 10)
+                self.assertEqual(reloaded_conv["loopHistory"][0]["signature"], "cmd:2")
+                self.assertEqual(reloaded_conv["loopHistory"][-1]["signature"], "cmd:11")
 
 
 if __name__ == "__main__":

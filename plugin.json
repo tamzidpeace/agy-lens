@@ -1,14 +1,14 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
-  "name": "agy-context-guard",
-  "displayName": "Context Guard",
-  "version": "1.0.0-beta.1",
-  "description": "Real-time context window monitor, bloat inspector, and configurable threshold guard with a live side-pane dashboard and one-click session handoff.",
+  "name": "agy-lens",
+  "displayName": "Agy Lens",
+  "version": "2.0.0-beta.1",
+  "description": "Unified Antigravity observability & guardrails: real-time context window monitor, quota burn-rate & alerts, cross-chat search, setup footprint inspector, and loop guard with a live side-pane dashboard.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Show my current context window usage and what is eating tokens",
-    "Set my Context Guard alert threshold to 300k tokens",
-    "Prepare a clean handoff brief to continue this task in a fresh chat"
+    "Show my current context usage, quota burn-rate, and setup footprint",
+    "Search my past chats for recent decisions or errors",
+    "Configure my Agy Lens thresholds, alerts, and loop guard"
   ],
   "author": {
     "name": "Arafat",
@@ -18,11 +18,12 @@
   "repository": "https://github.com/tamzidpeace/agy-context-guard",
   "license": "MIT",
   "keywords": [
+    "antigravity",
     "context",
-    "tokens",
-    "compaction",
-    "monitoring",
-    "dashboard",
-    "handoff"
+    "quota",
+    "search",
+    "customizations",
+    "guardrails",
+    "dashboard"
   ]
 }

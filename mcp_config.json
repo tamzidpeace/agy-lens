@@ -4,6 +4,7 @@
       "command": "python3",
       "args": ["${PLUGIN_ROOT}/server/mcp_server.py"],
       "env": {
+        "AGY_LENS_DATA_DIR": "${PLUGIN_DATA}",
         "CONTEXT_GUARD_DATA_DIR": "${PLUGIN_DATA}"
       }
     }

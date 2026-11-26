@@ -1315,3 +1315,478 @@ test("model quotas card renders 5h and weekly limits, countdowns, and triggers n
 
   controller.dispose();
 });
+
+function collectElementsByTag(node, tagUpper, out = []) {
+  if (!node || !node.tagName) return out;
+  if (node.tagName === tagUpper) out.push(node);
+  for (const child of node.children || []) {
+    collectElementsByTag(child, tagUpper, out);
+  }
+  return out;
+}
+
+test("Monitor tab displays quota burn-rate prediction and dismissible Loop Guard banner", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const calls = [];
+  const nowMs = Date.now();
+  const reset5h = new Date(nowMs + 4 * 3600 * 1000).toISOString();
+
+  let loopCleared = false;
+  const baseStatus = {
+    view: "status",
+    conversationId: "conv-loop-ui",
+    title: "Debug Test Loop",
+    status: "ok",
+    enabled: true,
+    mode: "stop",
+    warnPercent: 80,
+    model: "gemini-4-hydrogen-high",
+    effectiveTokens: 42000,
+    inputTokens: 12000,
+    cacheReadTokens: 28000,
+    outputTokens: 2000,
+    pendingDeltaTokens: 0,
+    cacheHitPercent: 70.0,
+    effectiveThresholdTokens: 300000,
+    warnThresholdTokens: 240000,
+    baseThresholdTokens: 300000,
+    snoozedUntilTokens: 0,
+    modelWindowTokens: 1048576,
+    thresholdPercent: 14.0,
+    windowPercent: 4.0,
+    remainingToThreshold: 258000,
+    avgDeltaPerTurn: 10000,
+    estimatedTurnsRemaining: 25,
+    compactionCount: 0,
+    history: [{ stepIndex: 1, totalTokens: 42000, deltaTokens: 42000 }],
+    bloatByCategory: { user: 1000, model: 5000, toolOutputs: 36000, system: 0 },
+    topBloatSteps: [],
+    activeLoop: {
+      signature: "cmd:npm test",
+      toolName: "run_command",
+      count: 3,
+      reason: "consecutive_failures",
+      lastErrorSnippet: "exit status 1",
+    },
+    modelQuota: {
+      available: true,
+      status: "ok",
+      fetchedAt: Math.floor(nowMs / 1000),
+      ageSeconds: 5,
+      fetching: false,
+      groups: [
+        {
+          name: "Gemini Models",
+          modelsSummary: "Gemini 4 Hydrogen",
+          buckets: [
+            {
+              id: "gemini-5h",
+              window: "5h",
+              label: "5h limit",
+              remainingFraction: 0.4,
+              remainingPercent: 40,
+              resetTime: reset5h,
+              prediction: {
+                state: "active",
+                burnRatePerHour: 20.0,
+                hoursUntilExhausted: 2.0,
+                hoursUntilReset: 4.0,
+                bufferHours: -2.0,
+                riskLevel: "at_risk",
+                sampleCount: 3,
+                windowObservedSeconds: 3600,
+                usedDeltaPct: 20.0,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      calls.push(params);
+      if (params.name === "app_clear_loop") {
+        loopCleared = true;
+        return {
+          content: [{ type: "text", text: "Cleared" }],
+          structuredContent: { ...baseStatus, activeLoop: null },
+        };
+      }
+      return { content: [], structuredContent: { ...baseStatus, activeLoop: loopCleared ? null : baseStatus.activeLoop } };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefresh: false,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  fakeApp.ontoolresult({ content: [], structuredContent: baseStatus });
+
+  const text = collectText(fakeDoc._appEl);
+  assert.ok(text.includes("Agy Lens"), "Header brand should display Agy Lens");
+  assert.ok(text.includes("Loop Guard"), "Active loop banner should render");
+  assert.ok(text.includes("run_command"), text);
+  assert.ok(text.includes("20%/hr") || text.includes("20.0%/hr"), `Expected burn rate in: ${text}`);
+  assert.ok(text.includes("before reset"), `Expected exhaustion warning in: ${text}`);
+
+  const dismissBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Dismiss Loop");
+  assert.ok(dismissBtn, "Dismiss Loop button must be rendered on Loop Guard banner");
+  dismissBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+
+  assert.ok(calls.some((c) => c.name === "app_clear_loop"));
+  assert.equal(collectText(fakeDoc._appEl).includes("Dismiss Loop"), false);
+
+  controller.dispose();
+});
+
+test("Search tab searches across chats, renders mark spans safely, and jumps to Monitor", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const calls = [];
+
+  const searchPayload = {
+    view: "search",
+    query: "pkce",
+    scope: "all",
+    includeSubagents: false,
+    totalIndexed: 4,
+    matchedCount: 1,
+    results: [
+      {
+        convId: "conv-oauth",
+        title: "Implement OAuth2 PKCE Flow",
+        updatedAt: "2026-11-26T06:00:00Z",
+        sourceApp: "antigravity",
+        isSubagent: false,
+        matchCount: 2,
+        editedFiles: ["src/auth/pkce.ts"],
+        snippets: [
+          {
+            source: "user",
+            label: "Prompt",
+            text: "Add PKCE verifier challenge",
+            spans: [[4, 8]],
+          },
+        ],
+      },
+    ],
+  };
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      calls.push(params);
+      if (params.name === "app_search") {
+        return { content: [], structuredContent: { ...searchPayload, query: params.arguments?.query || "" } };
+      }
+      return {
+        content: [],
+        structuredContent: {
+          view: "status",
+          conversationId: params.arguments?.conversationId || "conv-oauth",
+          status: "ok",
+          enabled: true,
+          mode: "stop",
+          warnPercent: 80,
+          model: "gemini-4-hydrogen-high",
+          effectiveTokens: 15000,
+          inputTokens: 14000,
+          cacheReadTokens: 0,
+          outputTokens: 1000,
+          pendingDeltaTokens: 0,
+          cacheHitPercent: 0,
+          effectiveThresholdTokens: 300000,
+          warnThresholdTokens: 240000,
+          baseThresholdTokens: 300000,
+          snoozedUntilTokens: 0,
+          modelWindowTokens: 1048576,
+          thresholdPercent: 5,
+          windowPercent: 1.4,
+          remainingToThreshold: 285000,
+          avgDeltaPerTurn: 0,
+          estimatedTurnsRemaining: null,
+          compactionCount: 0,
+          history: [],
+          bloatByCategory: { user: 0, model: 0, toolOutputs: 0, system: 0 },
+          topBloatSteps: [],
+        },
+      };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefresh: false,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  const searchTabBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Search");
+  assert.ok(searchTabBtn, "Search tab button must exist");
+  searchTabBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+
+  assert.ok(calls.some((c) => c.name === "app_search"));
+  const text = collectText(fakeDoc._appEl);
+  assert.ok(text.includes("Implement OAuth2 PKCE Flow"));
+  assert.ok(collectTags(fakeDoc._appEl).includes("MARK"), "Highlight spans must render as <mark> elements");
+
+  const openBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Open in Monitor");
+  assert.ok(openBtn);
+  openBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(
+    calls.some((c) => c.name === "app_refresh" && c.arguments?.conversationId === "conv-oauth"),
+  );
+
+  controller.dispose();
+});
+
+test("Setup tab renders startup footprint KPIs, warnings, and Settings Loop Guard + Alerts", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const calls = [];
+
+  const footprintPayload = {
+    view: "footprint",
+    workspacePath: "/repo/app",
+    summary: {
+      estimatedStartupTokens: 2450,
+      onDemandSkillsTokens: 5100,
+      observedStartupTokens: 3200,
+      rulesCount: 1,
+      pluginsCount: 1,
+      skillsCount: 1,
+      builtinSkillsCount: 2,
+      mcpServersCount: 1,
+      hooksCount: 1,
+    },
+    builtinSkillsSummary: { count: 2, frontmatterTokens: 120, onDemandTokens: 1800 },
+    warnings: [
+      {
+        code: "duplicate_plugin",
+        severity: "warning",
+        title: "Duplicate context plugin installed",
+        detail: "Run agy plugin uninstall agy-context-guard",
+        path: "/home/.gemini/config/plugins/agy-context-guard",
+      },
+    ],
+    rules: [{ name: "GEMINI.md", scope: "workspace", path: "/repo/app/GEMINI.md", bytes: 400, estTokens: 100, alwaysLoaded: true }],
+    plugins: [{ id: "agy-lens", name: "agy-lens", version: "2.0.0-beta.1", enabled: true, scope: "global", path: "/home/.gemini/config/plugins/agy-lens", hasMcp: true, hasHooks: true, skillsCount: 1, rulesCount: 0 }],
+    skills: [{ name: "lens", description: "Agy Lens cockpit", scope: "plugin", source: "agy-lens", path: "/home/.gemini/config/plugins/agy-lens/skills/lens/SKILL.md", frontmatterTokens: 20, bodyTokens: 300, enabled: true }],
+    mcpServers: [{ name: "monitor", scope: "plugin", source: "agy-lens", enabled: true, commandPreview: "python3 server/mcp_server.py", envKeys: ["AGY_LENS_DATA_DIR"], envKeyCount: 1, estTokens: 350, path: "/home/.gemini/config/plugins/agy-lens/mcp_config.json" }],
+    hooks: [{ name: "agy-lens", scope: "plugin", enabled: true, events: ["PostToolUse", "Stop"], timeoutSeconds: 5, path: "/home/.gemini/config/plugins/agy-lens/hooks.json" }],
+  };
+
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities() {
+      return { serverTools: { listChanged: false } };
+    },
+    getHostContext() {
+      return { theme: "dark", toolInfo: { tool: { name: "context_status" } } };
+    },
+    async callServerTool(params) {
+      calls.push(params);
+      if (params.name === "app_footprint") {
+        return { content: [], structuredContent: footprintPayload };
+      }
+      if (params.name === "app_test_alert") {
+        return { content: [], structuredContent: { view: "alert_test", sent: true, reason: "ok" } };
+      }
+      return {
+        content: [],
+        structuredContent: {
+          view: "status",
+          conversationId: "conv-setup",
+          status: "ok",
+          enabled: true,
+          mode: "stop",
+          warnPercent: 80,
+          model: "gemini-4-hydrogen-high",
+          effectiveTokens: 20000,
+          inputTokens: 18000,
+          cacheReadTokens: 0,
+          outputTokens: 2000,
+          pendingDeltaTokens: 0,
+          cacheHitPercent: 0,
+          effectiveThresholdTokens: 300000,
+          warnThresholdTokens: 240000,
+          baseThresholdTokens: 300000,
+          snoozedUntilTokens: 0,
+          modelWindowTokens: 1048576,
+          thresholdPercent: 6.7,
+          windowPercent: 1.9,
+          remainingToThreshold: 280000,
+          avgDeltaPerTurn: 0,
+          estimatedTurnsRemaining: null,
+          compactionCount: 0,
+          history: [],
+          bloatByCategory: { user: 0, model: 0, toolOutputs: 0, system: 0 },
+          topBloatSteps: [],
+          loopGuard: { enabled: true, consecutiveThreshold: 3, nudgeOncePerStreak: true, autoPauseThreshold: 5 },
+          alerts: { soundEnabled: true, desktopNotificationEnabled: true, notifyOnStop: true, notifyOnThreshold: true, notifyOnLoop: true, notifyOnLowQuotaPct: 15, cooldownSeconds: 15 },
+        },
+      };
+    },
+    async sendMessage() {
+      return {};
+    },
+    async updateModelContext() {},
+  };
+
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefresh: false,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+
+  const setupTabBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Setup");
+  assert.ok(setupTabBtn, "Setup tab button must exist");
+  setupTabBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+
+  const setupText = collectText(fakeDoc._appEl);
+  assert.ok(setupText.includes("Est. Startup"), setupText);
+  assert.ok(setupText.includes("Duplicate context plugin installed"), setupText);
+  assert.ok(setupText.includes("GEMINI.md"), setupText);
+  assert.ok(setupText.includes("python3 server/mcp_server.py"), setupText);
+
+  // Switch back to Monitor, open Settings, test alert and save loopGuard/alerts
+  const settingsBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Settings");
+  assert.ok(settingsBtn);
+  settingsBtn.dispatchEvent({ type: "click" });
+
+  const testAlertBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Test Sound & Alert");
+  assert.ok(testAlertBtn, "Test Sound & Alert button must render in Settings");
+  testAlertBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(calls.some((c) => c.name === "app_test_alert"));
+
+  const saveBtn = collectButtons(fakeDoc._appEl).find((b) => b.textContent === "Save Settings");
+  assert.ok(saveBtn);
+  saveBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+
+  const saveCall = calls.find((c) => c.name === "app_save_settings");
+  assert.ok(saveCall);
+  assert.ok(saveCall.arguments.loopGuard);
+  assert.ok(saveCall.arguments.alerts);
+
+  controller.dispose();
+});
+
+test("Turn-by-Turn Growth filters out pre-compaction turns from earlier epochs", async () => {
+  const mod = await loadMainModule();
+  const fakeDoc = createFakeDocument();
+  const compactedStatus = {
+    view: "status",
+    conversationId: "conv-compact",
+    status: "ok",
+    enabled: true,
+    mode: "stop",
+    warnPercent: 80,
+    model: "gemini-4-hydrogen-high",
+    effectiveTokens: 8100,
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+    pendingDeltaTokens: 8100,
+    cacheHitPercent: 0,
+    effectiveThresholdTokens: 300000,
+    warnThresholdTokens: 240000,
+    baseThresholdTokens: 300000,
+    snoozedUntilTokens: 0,
+    modelWindowTokens: 1048576,
+    thresholdPercent: 2.7,
+    windowPercent: 0.8,
+    remainingToThreshold: 291900,
+    avgDeltaPerTurn: 0,
+    estimatedTurnsRemaining: null,
+    compactionCount: 4,
+    activeEpochStep: 1204,
+    history: [
+      { stepIndex: 1202, inputTokens: 2000, cacheReadTokens: 398000, outputTokens: 1700, totalTokens: 401700, deltaTokens: 5000, model: "gemini-4-hydrogen-high", createdAt: "" },
+    ],
+    bloatByCategory: { user: 0, model: 0, toolOutputs: 0, system: 8100 },
+    topBloatSteps: [],
+  };
+  const fakeApp = {
+    ontoolinput: undefined,
+    ontoolresult: undefined,
+    ontoolcancelled: undefined,
+    onhostcontextchanged: undefined,
+    async connect() {},
+    getHostCapabilities: () => ({ serverTools: { listChanged: true } }),
+    getHostContext: () => ({ theme: "dark", toolInfo: { tool: { name: "context_status" } } }),
+    callServerTool: async () => ({ content: [], structuredContent: compactedStatus }),
+    sendMessage: async () => ({}),
+    updateModelContext: async () => {},
+  };
+  const controller = await mod.mountDashboard({
+    app: fakeApp,
+    doc: fakeDoc,
+    autoFetchDelayMs: 0,
+    autoRefresh: false,
+    applyTheme: () => {},
+    applyStyles: () => {},
+    applyFonts: () => {},
+  });
+  fakeApp.ontoolresult({ content: [], structuredContent: compactedStatus });
+
+  const renderedText = collectText(fakeDoc._appEl);
+  assert.ok(renderedText.includes("Since #1204 · 0 turns"), renderedText);
+  assert.ok(renderedText.includes("Compacted at step #1204"), renderedText);
+  assert.ok(!renderedText.includes("Peak: 401.7k"), renderedText);
+  controller.dispose();
+});

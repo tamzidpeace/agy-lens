@@ -803,6 +803,158 @@ textarea {
   display: block;
 }
 
+.cg-quota-pred {
+  font-size: 10px;
+  color: var(--color-text-tertiary, var(--cg-text-tertiary));
+  margin-top: 1px;
+}
+
+.cg-quota-pred-risk {
+  color: var(--color-text-danger, var(--cg-text-danger));
+  font-weight: 600;
+}
+
+.cg-quota-pred-tight {
+  color: var(--color-text-warning, var(--cg-text-warning));
+  font-weight: 500;
+}
+
+.cg-quota-pred-safe {
+  color: var(--color-text-success, var(--cg-text-success));
+}
+
+.cg-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--color-border-primary, var(--cg-border-primary));
+  padding-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.cg-tab {
+  padding: 4px 10px;
+  border-radius: var(--border-radius-sm, var(--cg-radius-sm));
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary, var(--cg-text-secondary));
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.cg-tab:hover {
+  background: var(--color-background-tertiary, var(--cg-bg-tertiary));
+  color: var(--color-text-primary, var(--cg-text-primary));
+}
+
+.cg-tab-active {
+  background: var(--cg-bg-info);
+  border-color: var(--cg-accent);
+  color: var(--cg-text-info);
+  font-weight: 600;
+}
+
+.cg-loop-banner {
+  background: var(--cg-bg-warning);
+  border: 1px solid var(--cg-text-warning);
+  border-radius: var(--border-radius-md, var(--cg-radius-md));
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.cg-search-bar,
+.cg-setup-bar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.cg-search-bar .cg-input,
+.cg-setup-bar .cg-input {
+  flex: 1 1 160px;
+  min-width: 120px;
+}
+
+.cg-chip-row {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.cg-chip {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--color-background-tertiary, var(--cg-bg-tertiary));
+  border: 1px solid var(--color-border-primary, var(--cg-border-primary));
+  color: var(--color-text-secondary, var(--cg-text-secondary));
+  font-family: var(--font-mono, var(--cg-font-mono));
+}
+
+.cg-snippet {
+  font-size: 11.5px;
+  padding: 5px 8px;
+  border-radius: var(--border-radius-sm, var(--cg-radius-sm));
+  background: var(--color-background-tertiary, var(--cg-bg-tertiary));
+  color: var(--color-text-secondary, var(--cg-text-secondary));
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.cg-mark {
+  background: var(--cg-bg-warning);
+  color: var(--color-text-primary, var(--cg-text-primary));
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: 600;
+}
+
+.cg-warn-card {
+  border-radius: var(--border-radius-sm, var(--cg-radius-sm));
+  padding: 7px 9px;
+  border: 1px solid var(--cg-text-warning);
+  background: var(--cg-bg-warning);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11.5px;
+}
+
+.cg-warn-card-info {
+  border-color: var(--cg-accent);
+  background: var(--cg-bg-info);
+}
+
+.cg-subcard {
+  padding: 6px 8px;
+  border-radius: var(--border-radius-sm, var(--cg-radius-sm));
+  background: var(--color-background-tertiary, var(--cg-bg-tertiary));
+  border: 1px solid var(--color-border-primary, var(--cg-border-primary));
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cg-subcard-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.cg-path {
+  font-size: 10.5px;
+  font-family: var(--font-mono, var(--cg-font-mono));
+  color: var(--color-text-tertiary, var(--cg-text-tertiary));
+  word-break: break-all;
+}
+
 @media (min-width: 540px) {
   .cg-metrics-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -861,7 +1013,7 @@ async function build() {
     "<head>",
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
-    "<title>Context Guard</title>",
+    "<title>Agy Lens</title>",
     `<style>${compactCss}</style>`,
     "</head>",
     "<body>",
